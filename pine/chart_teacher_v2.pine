@@ -1,0 +1,87 @@
+//@version=6
+indicator("Chart Teacher - Multi-Timeframe Trigger v2", overlay=true, max_lines_count=20, max_labels_count=50)
+
+// 이 스크립트는 TradingView를 실시간 감지기로 사용합니다.
+// 전체 지표·패턴·과거 유사구간 분석은 Webhook을 받은 Chart Teacher 서버가 수행합니다.
+
+leftBars = input.int(5, "Pivot left bars", minval=2)
+rightBars = input.int(5, "Pivot right bars", minval=2)
+heartbeatEnabled = input.bool(true, "15분봉 마감마다 서버 종합 분석 요청")
+showLines = input.bool(true, "추세선 표시")
+
+ph = ta.pivothigh(high, leftBars, rightBars)
+pl = ta.pivotlow(low, leftBars, rightBars)
+
+var float phPrevPrice = na
+var int phPrevBar = na
+var float phLastPrice = na
+var int phLastBar = na
+var float plPrevPrice = na
+var int plPrevBar = na
+var float plLastPrice = na
+var int plLastBar = na
+
+if not na(ph)
+    phPrevPrice := phLastPrice
+    phPrevBar := phLastBar
+    phLastPrice := ph
+    phLastBar := bar_index - rightBars
+
+if not na(pl)
+    plPrevPrice := plLastPrice
+    plPrevBar := plLastBar
+    plLastPrice := pl
+    plLastBar := bar_index - rightBars
+
+validDown = not na(phPrevPrice) and not na(phLastPrice) and phLastBar > phPrevBar and phLastPrice < phPrevPrice
+validUp = not na(plPrevPrice) and not na(plLastPrice) and plLastBar > plPrevBar and plLastPrice > plPrevPrice
+downSlope = validDown ? (phLastPrice - phPrevPrice) / (phLastBar - phPrevBar) : na
+upSlope = validUp ? (plLastPrice - plPrevPrice) / (plLastBar - plPrevBar) : na
+downTL = validDown ? phLastPrice + downSlope * (bar_index - phLastBar) : na
+upTL = validUp ? plLastPrice + upSlope * (bar_index - plLastBar) : na
+
+var line downLine = na
+var line upLine = na
+if showLines and validDown
+    if na(downLine)
+        downLine := line.new(phPrevBar, phPrevPrice, phLastBar, phLastPrice, xloc=xloc.bar_index, extend=extend.right, color=color.red)
+    else
+        line.set_xy1(downLine, phPrevBar, phPrevPrice)
+        line.set_xy2(downLine, phLastBar, phLastPrice)
+if showLines and validUp
+    if na(upLine)
+        upLine := line.new(plPrevBar, plPrevPrice, plLastBar, plLastPrice, xloc=xloc.bar_index, extend=extend.right, color=color.lime)
+    else
+        line.set_xy1(upLine, plPrevBar, plPrevPrice)
+        line.set_xy2(upLine, plLastBar, plLastPrice)
+
+downBreakout = validDown and barstate.isconfirmed and ta.crossover(close, downTL)
+upBreakdown = validUp and barstate.isconfirmed and ta.crossunder(close, upTL)
+
+rsiValue = ta.rsi(close, 14)
+volumeAverage = ta.sma(volume, 20)
+volumeRatio = volumeAverage > 0 ? volume / volumeAverage : na
+ema20 = ta.ema(close, 20)
+ema50 = ta.ema(close, 50)
+ema200 = ta.ema(close, 200)
+
+// 이전에 마감된 상위 시간봉만 사용하여 재도색 위험을 줄입니다.
+state1D = request.security(syminfo.tickerid, "D", close[1] > ta.ema(close, 20)[1] ? 1 : -1, lookahead=barmerge.lookahead_on)
+state4H = request.security(syminfo.tickerid, "240", close[1] > ta.ema(close, 20)[1] ? 1 : -1, lookahead=barmerge.lookahead_on)
+state1H = request.security(syminfo.tickerid, "60", close[1] > ta.ema(close, 20)[1] ? 1 : -1, lookahead=barmerge.lookahead_on)
+state15m = request.security(syminfo.tickerid, "15", close[1] > ta.ema(close, 20)[1] ? 1 : -1, lookahead=barmerge.lookahead_on)
+
+makeJson(string eventName) =>
+    '{"event":"' + eventName + '","symbol":"' + syminfo.ticker + '","exchange":"' + syminfo.prefix + '","timeframe":"' + timeframe.period + '","price":' + str.tostring(close) + ',"volume_ratio":' + str.tostring(volumeRatio) + ',"rsi":' + str.tostring(rsiValue) + ',"ema20":' + str.tostring(ema20) + ',"ema50":' + str.tostring(ema50) + ',"ema200":' + str.tostring(ema200) + ',"state_1d":' + str.tostring(state1D) + ',"state_4h":' + str.tostring(state4H) + ',"state_1h":' + str.tostring(state1H) + ',"state_15m":' + str.tostring(state15m) + '}'
+
+eventName = downBreakout ? "downtrend_breakout" : upBreakdown ? "uptrend_breakdown" : "market_scan"
+shouldAlert = barstate.isconfirmed and (downBreakout or upBreakdown or (heartbeatEnabled and timeframe.period == "15"))
+
+if shouldAlert
+    alert(makeJson(eventName), alert.freq_once_per_bar_close)
+
+plot(ema20, "EMA 20", color=color.yellow)
+plot(ema50, "EMA 50", color=color.orange)
+plot(ema200, "EMA 200", color=color.blue)
+plotshape(downBreakout, "하락 추세선 돌파", shape.labelup, location.belowbar, color=color.lime, text="TL 돌파")
+plotshape(upBreakdown, "상승 추세선 이탈", shape.labeldown, location.abovebar, color=color.red, text="TL 이탈")

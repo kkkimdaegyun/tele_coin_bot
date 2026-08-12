@@ -1,0 +1,88 @@
+//@version=6
+indicator("Chart Teacher - Trendline Alerts v1", overlay=true, max_lines_count=20)
+
+// ===== 설정 =====
+leftBars  = input.int(5, "Pivot left bars", minval=2)
+rightBars = input.int(5, "Pivot right bars", minval=2)
+showLines = input.bool(true, "Show trendlines")
+
+// ===== 확정 Pivot =====
+ph = ta.pivothigh(high, leftBars, rightBars)
+pl = ta.pivotlow(low, leftBars, rightBars)
+
+// 최근 2개 Pivot High
+var float phPrevPrice = na
+var int   phPrevBar   = na
+var float phLastPrice = na
+var int   phLastBar   = na
+
+// 최근 2개 Pivot Low
+var float plPrevPrice = na
+var int   plPrevBar   = na
+var float plLastPrice = na
+var int   plLastBar   = na
+
+if not na(ph)
+    phPrevPrice := phLastPrice
+    phPrevBar   := phLastBar
+    phLastPrice := ph
+    phLastBar   := bar_index - rightBars
+
+if not na(pl)
+    plPrevPrice := plLastPrice
+    plPrevBar   := plLastBar
+    plLastPrice := pl
+    plLastBar   := bar_index - rightBars
+
+// ===== 자동 추세선 계산 =====
+bool validDown = not na(phPrevPrice) and not na(phLastPrice) and phLastBar > phPrevBar and phLastPrice < phPrevPrice
+bool validUp   = not na(plPrevPrice) and not na(plLastPrice) and plLastBar > plPrevBar and plLastPrice > plPrevPrice
+
+float downSlope = validDown ? (phLastPrice - phPrevPrice) / (phLastBar - phPrevBar) : na
+float upSlope   = validUp   ? (plLastPrice - plPrevPrice) / (plLastBar - plPrevBar) : na
+
+float downTL = validDown ? phLastPrice + downSlope * (bar_index - phLastBar) : na
+float upTL   = validUp   ? plLastPrice + upSlope * (bar_index - plLastBar) : na
+
+// ===== 선 표시 =====
+var line downLine = na
+var line upLine = na
+
+if showLines and validDown
+    if na(downLine)
+        downLine := line.new(phPrevBar, phPrevPrice, phLastBar, phLastPrice, xloc=xloc.bar_index, extend=extend.right)
+    else
+        line.set_xy1(downLine, phPrevBar, phPrevPrice)
+        line.set_xy2(downLine, phLastBar, phLastPrice)
+        line.set_extend(downLine, extend.right)
+
+if showLines and validUp
+    if na(upLine)
+        upLine := line.new(plPrevBar, plPrevPrice, plLastBar, plLastPrice, xloc=xloc.bar_index, extend=extend.right)
+    else
+        line.set_xy1(upLine, plPrevBar, plPrevPrice)
+        line.set_xy2(upLine, plLastBar, plLastPrice)
+        line.set_extend(upLine, extend.right)
+
+// ===== 신호 =====
+// 초보자용 MVP에서는 "봉 종가 확정"을 기본으로 사용하여 장중 가짜 돌파를 줄입니다.
+downBreakout = validDown and barstate.isconfirmed and ta.crossover(close, downTL)
+upBreakdown  = validUp   and barstate.isconfirmed and ta.crossunder(close, upTL)
+
+plotshape(downBreakout, title="Downtrend breakout", style=shape.labelup, location=location.belowbar, text="하락TL 돌파", size=size.tiny)
+plotshape(upBreakdown, title="Uptrend breakdown", style=shape.labeldown, location=location.abovebar, text="상승TL 이탈", size=size.tiny)
+
+// ===== JSON webhook =====
+makeJson(string eventName, float linePrice) =>
+    '{"event":"' + eventName +
+    '","symbol":"' + syminfo.ticker +
+    '","exchange":"' + syminfo.prefix +
+    '","timeframe":"' + timeframe.period +
+    '","price":' + str.tostring(close) +
+    ',"trendline_price":' + str.tostring(linePrice) + '}'
+
+if downBreakout
+    alert(makeJson("downtrend_breakout", downTL), alert.freq_once_per_bar_close)
+
+if upBreakdown
+    alert(makeJson("uptrend_breakdown", upTL), alert.freq_once_per_bar_close)

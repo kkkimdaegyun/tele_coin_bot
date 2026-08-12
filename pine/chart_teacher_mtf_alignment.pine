@@ -1,0 +1,94 @@
+//@version=6
+indicator("Chart Teacher - MTF EMA Alignment", overlay=true, max_labels_count=100)
+
+// Confirmed bars reduce intrabar state changes and repainting.
+showEma = input.bool(true, "Show chart EMAs")
+showRibbon = input.bool(true, "Show EMA 20/50 ribbon")
+showConsensusBackground = input.bool(true, "Tint background when 3+ timeframes agree")
+showHeatmap = input.bool(true, "Show timeframe heatmap")
+showTouches = input.bool(true, "Show EMA touch dots")
+touchTolerancePercent = input.float(0.05, "EMA touch tolerance (%)", minval=0.0, maxval=1.0, step=0.01)
+
+alignment(float fast, float medium, float slow) =>
+    fast > medium and medium > slow ? 1 : fast < medium and medium < slow ? -1 : 0
+
+stateText(int state) =>
+    state == 1 ? "UP" : state == -1 ? "DN" : "--"
+
+stateColor(int state) =>
+    state == 1 ? color.rgb(0, 166, 81) : state == -1 ? color.rgb(220, 53, 69) : color.rgb(245, 166, 35)
+
+touched(float barLow, float barHigh, float level) =>
+    tolerance = touchTolerancePercent / 100.0
+    not na(level) and barLow <= level * (1.0 + tolerance) and barHigh >= level * (1.0 - tolerance)
+
+touchText(float barLow, float barHigh, float fast, float medium, float slow) =>
+    touch20 = touched(barLow, barHigh, fast)
+    touch50 = touched(barLow, barHigh, medium)
+    touch200 = touched(barLow, barHigh, slow)
+    touch20 and touch50 and touch200 ? "20/50/200" : touch20 and touch50 ? "20/50" : touch20 and touch200 ? "20/200" : touch50 and touch200 ? "50/200" : touch20 ? "20" : touch50 ? "50" : touch200 ? "200" : "--"
+
+touchColor(float barLow, float barHigh, float fast, float medium, float slow) =>
+    touched(barLow, barHigh, slow) ? color.rgb(41, 121, 255) : touched(barLow, barHigh, medium) ? color.rgb(255, 112, 67) : touched(barLow, barHigh, fast) ? color.rgb(255, 193, 7) : color.rgb(60, 60, 60)
+
+// Every timeframe uses the previous confirmed EMA values.
+[lowD, highD, ema20D, ema50D, ema200D] = request.security(syminfo.tickerid, "D", [low[1], high[1], ta.ema(close, 20)[1], ta.ema(close, 50)[1], ta.ema(close, 200)[1]], lookahead=barmerge.lookahead_on)
+[lowH4, highH4, ema20H4, ema50H4, ema200H4] = request.security(syminfo.tickerid, "240", [low[1], high[1], ta.ema(close, 20)[1], ta.ema(close, 50)[1], ta.ema(close, 200)[1]], lookahead=barmerge.lookahead_on)
+[lowH1, highH1, ema20H1, ema50H1, ema200H1] = request.security(syminfo.tickerid, "60", [low[1], high[1], ta.ema(close, 20)[1], ta.ema(close, 50)[1], ta.ema(close, 200)[1]], lookahead=barmerge.lookahead_on)
+[lowM15, highM15, ema20M15, ema50M15, ema200M15] = request.security(syminfo.tickerid, "15", [low[1], high[1], ta.ema(close, 20)[1], ta.ema(close, 50)[1], ta.ema(close, 200)[1]], lookahead=barmerge.lookahead_on)
+
+stateD = alignment(ema20D, ema50D, ema200D)
+stateH4 = alignment(ema20H4, ema50H4, ema200H4)
+stateH1 = alignment(ema20H1, ema50H1, ema200H1)
+stateM15 = alignment(ema20M15, ema50M15, ema200M15)
+
+bullCount = (stateD == 1 ? 1 : 0) + (stateH4 == 1 ? 1 : 0) + (stateH1 == 1 ? 1 : 0) + (stateM15 == 1 ? 1 : 0)
+bearCount = (stateD == -1 ? 1 : 0) + (stateH4 == -1 ? 1 : 0) + (stateH1 == -1 ? 1 : 0) + (stateM15 == -1 ? 1 : 0)
+fullBull = bullCount == 4
+fullBear = bearCount == 4
+
+ema20 = ta.ema(close, 20)
+ema50 = ta.ema(close, 50)
+ema200 = ta.ema(close, 200)
+touch20Now = touched(low, high, ema20)
+touch50Now = touched(low, high, ema50)
+touch200Now = touched(low, high, ema200)
+
+plot20 = plot(showEma ? ema20 : na, "EMA 20", color=color.rgb(255, 193, 7), linewidth=2)
+plot50 = plot(showEma ? ema50 : na, "EMA 50", color=color.rgb(255, 112, 67), linewidth=2)
+plot(showEma ? ema200 : na, "EMA 200", color=color.rgb(41, 121, 255), linewidth=3)
+fill(plot20, plot50, color=showRibbon ? (ema20 >= ema50 ? color.new(color.green, 88) : color.new(color.red, 88)) : na, title="EMA direction ribbon")
+plot(showTouches and touch20Now ? ema20 : na, "EMA 20 touch", color=color.rgb(255, 193, 7), linewidth=5, style=plot.style_circles)
+plot(showTouches and touch50Now ? ema50 : na, "EMA 50 touch", color=color.rgb(255, 112, 67), linewidth=5, style=plot.style_circles)
+plot(showTouches and touch200Now ? ema200 : na, "EMA 200 touch", color=color.rgb(41, 121, 255), linewidth=5, style=plot.style_circles)
+
+consensusColor = bullCount >= 3 ? color.new(color.green, 92) : bearCount >= 3 ? color.new(color.red, 92) : na
+bgcolor(showConsensusBackground ? consensusColor : na, title="Multi-timeframe consensus background")
+
+plotshape(fullBull and not fullBull[1], title="All timeframes bullish alignment", style=shape.labelup, location=location.belowbar, color=color.rgb(0, 166, 81), textcolor=color.white, text="4TF UP", size=size.small)
+plotshape(fullBear and not fullBear[1], title="All timeframes bearish alignment", style=shape.labeldown, location=location.abovebar, color=color.rgb(220, 53, 69), textcolor=color.white, text="4TF DN", size=size.small)
+
+var table heatmap = table.new(position.top_right, 4, 3, frame_color=color.new(color.white, 55), frame_width=1, border_width=1)
+if barstate.islast and showHeatmap
+    table.cell(heatmap, 0, 0, "1D", text_color=color.white, bgcolor=color.rgb(45, 45, 45), text_size=size.small)
+    table.cell(heatmap, 1, 0, "4H", text_color=color.white, bgcolor=color.rgb(45, 45, 45), text_size=size.small)
+    table.cell(heatmap, 2, 0, "1H", text_color=color.white, bgcolor=color.rgb(45, 45, 45), text_size=size.small)
+    table.cell(heatmap, 3, 0, "15m", text_color=color.white, bgcolor=color.rgb(45, 45, 45), text_size=size.small)
+    table.cell(heatmap, 0, 1, stateText(stateD), text_color=color.white, bgcolor=stateColor(stateD), text_size=size.large, height=5)
+    table.cell(heatmap, 1, 1, stateText(stateH4), text_color=color.white, bgcolor=stateColor(stateH4), text_size=size.large, height=5)
+    table.cell(heatmap, 2, 1, stateText(stateH1), text_color=color.white, bgcolor=stateColor(stateH1), text_size=size.large, height=5)
+    table.cell(heatmap, 3, 1, stateText(stateM15), text_color=color.white, bgcolor=stateColor(stateM15), text_size=size.large, height=5)
+    table.cell(heatmap, 0, 2, touchText(lowD, highD, ema20D, ema50D, ema200D), text_color=color.white, bgcolor=touchColor(lowD, highD, ema20D, ema50D, ema200D), text_size=size.tiny)
+    table.cell(heatmap, 1, 2, touchText(lowH4, highH4, ema20H4, ema50H4, ema200H4), text_color=color.white, bgcolor=touchColor(lowH4, highH4, ema20H4, ema50H4, ema200H4), text_size=size.tiny)
+    table.cell(heatmap, 2, 2, touchText(lowH1, highH1, ema20H1, ema50H1, ema200H1), text_color=color.white, bgcolor=touchColor(lowH1, highH1, ema20H1, ema50H1, ema200H1), text_size=size.tiny)
+    table.cell(heatmap, 3, 2, touchText(lowM15, highM15, ema20M15, ema50M15, ema200M15), text_color=color.white, bgcolor=touchColor(lowM15, highM15, ema20M15, ema50M15, ema200M15), text_size=size.tiny)
+if barstate.islast and not showHeatmap
+    table.clear(heatmap, 0, 0, 3, 2)
+
+alertcondition(fullBull and not fullBull[1], "All timeframes bullish alignment", "{{ticker}} 1D/4H/1H/15m EMA alignment is fully bullish.")
+alertcondition(fullBear and not fullBear[1], "All timeframes bearish alignment", "{{ticker}} 1D/4H/1H/15m EMA alignment is fully bearish.")
+alertcondition(stateH4 == 1 and stateH4[1] != 1, "4H bullish alignment", "{{ticker}} 4H EMA alignment turned bullish.")
+alertcondition(stateH4 == -1 and stateH4[1] != -1, "4H bearish alignment", "{{ticker}} 4H EMA alignment turned bearish.")
+alertcondition(touch20Now and not touch20Now[1], "EMA 20 touch", "{{ticker}} touched EMA 20 on {{interval}}.")
+alertcondition(touch50Now and not touch50Now[1], "EMA 50 touch", "{{ticker}} touched EMA 50 on {{interval}}.")
+alertcondition(touch200Now and not touch200Now[1], "EMA 200 touch", "{{ticker}} touched EMA 200 on {{interval}}.")
