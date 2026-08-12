@@ -10,6 +10,7 @@ from analysis_report import build_analysis_message, build_ema_signal_message, bu
 from analysis_service import SUPPORTED_SYMBOLS, analyze_symbol
 from ema_chart import build_ema_chart_image, build_market_overview_image
 from ema_signals import collect_ema_signals
+from sentiment_context import get_fear_greed
 from storage import ChartTeacherStore
 from telegram_client import send_telegram, send_telegram_photo
 
@@ -54,19 +55,24 @@ async def scan_and_notify(symbol: str, analysis: MarketAnalysis | None = None) -
     if not store.claim_signal(symbol, fingerprint_payload, now_ms):
         return False
 
+    sentiment = await get_fear_greed()
     try:
-        image = await build_market_overview_image(analysis)
+        image = await build_market_overview_image(analysis, sentiment=sentiment)
         await send_telegram_photo(
             image,
             (
                 f"📊 <b>{symbol.removesuffix('USDT')} 트레이더 한눈 요약</b>\n"
-                "시간대·EMA·지표·지지저항·패턴·과거 유사 경로·거시환경"
+                "시간대·EMA·지표·지지저항·패턴·과거 유사 경로·공포탐욕·거시환경"
             ),
             filename=f"{symbol.lower()}_market_overview.png",
         )
     except Exception:
         log.exception("Market overview image delivery failed: symbol=%s", symbol)
-    message = build_analysis_message(analysis, trigger=significant["description"])
+    message = build_analysis_message(
+        analysis,
+        trigger=significant["description"],
+        sentiment=sentiment,
+    )
     await send_telegram(message)
     log.info("Important analysis sent: symbol=%s event=%s", symbol, significant["event"])
     return True
@@ -86,16 +92,17 @@ async def send_hourly_summary(analyses: list[MarketAnalysis]) -> bool:
     if not store.claim_signal("MARKET", fingerprint_payload, now_ms):
         return False
 
+    sentiment = await get_fear_greed()
     try:
         for analysis in analyses:
             try:
-                image = await build_market_overview_image(analysis)
+                image = await build_market_overview_image(analysis, sentiment=sentiment)
                 coin = analysis.symbol.removesuffix("USDT")
                 await send_telegram_photo(
                     image,
                     (
                         f"🕐 <b>{coin} 1시간 트레이더 보드</b>\n"
-                        "실제 가격·시간대·지표·패턴·과거 유사 경로·거시환경"
+                        "실제 가격·시간대·지표·패턴·과거 유사 경로·공포탐욕·거시환경"
                     ),
                     filename=f"{analysis.symbol.lower()}_hourly_board.png",
                 )
@@ -104,7 +111,7 @@ async def send_hourly_summary(analyses: list[MarketAnalysis]) -> bool:
                     "Hourly market image delivery failed: symbol=%s",
                     analysis.symbol,
                 )
-        await send_telegram(build_hourly_summary_message(analyses))
+        await send_telegram(build_hourly_summary_message(analyses, sentiment=sentiment))
     except Exception:
         # Allow the next five-minute scan to retry this hour if Telegram was unavailable.
         store.release_signal(fingerprint_payload)
@@ -146,9 +153,15 @@ async def scan_ema_and_notify(symbol: str, analysis: MarketAnalysis) -> int:
     if not claimed:
         return 0
     claimed_signals = [signal for signal, _ in claimed]
+    sentiment = await get_fear_greed()
     try:
         try:
-            chart_image = await build_ema_chart_image(symbol, claimed_signals, analysis=analysis)
+            chart_image = await build_ema_chart_image(
+                symbol,
+                claimed_signals,
+                analysis=analysis,
+                sentiment=sentiment,
+            )
             coin = symbol.removesuffix("USDT")
             timeframes = ", ".join(
                 dict.fromkeys(signal.interval.upper() for signal in claimed_signals)
@@ -170,6 +183,7 @@ async def scan_ema_and_notify(symbol: str, analysis: MarketAnalysis) -> int:
                 analysis,
                 claimed_signals,
                 tolerance_percent=tolerance_percent,
+                sentiment=sentiment,
             )
         )
     except Exception:

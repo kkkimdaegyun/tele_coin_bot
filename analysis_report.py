@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from analysis_engine import MarketAnalysis, TimeframeAnalysis
 from formatter import _fmt_price
 from investor_guidance import build_bottom_decision, build_investor_notices
+from sentiment_context import FearGreedSnapshot, format_change
 
 if TYPE_CHECKING:
     from ema_signals import EmaSignal
@@ -24,7 +25,11 @@ STRUCTURE_LABELS = {
 KST = timezone(timedelta(hours=9))
 
 
-def build_analysis_message(analysis: MarketAnalysis, trigger: str | None = None) -> str:
+def build_analysis_message(
+    analysis: MarketAnalysis,
+    trigger: str | None = None,
+    sentiment: FearGreedSnapshot | None = None,
+) -> str:
     primary = analysis.important_patterns[0] if analysis.important_patterns else None
     if primary:
         title = f"🚨 <b>{escape(analysis.symbol)} 중요 변화 감지</b>"
@@ -61,6 +66,16 @@ def build_analysis_message(analysis: MarketAnalysis, trigger: str | None = None)
         lines.append(f"가까운 지지: {_fmt_price(detail.support)}")
     if detail.resistance is not None:
         lines.append(f"가까운 저항: {_fmt_price(detail.resistance)}")
+
+    if sentiment is not None:
+        lines.extend([
+            "",
+            "<b>공포·탐욕 지수 · BTC 중심</b>",
+            f"<b>{sentiment.value}/100 · {escape(sentiment.label)}</b> · "
+            f"전일 {format_change(sentiment.change_1d)} · 7일 {format_change(sentiment.change_7d)}",
+            escape(sentiment.guidance),
+            "출처: Alternative.me · 단독 매수·매도 신호 아님",
+        ])
 
     if analysis.important_patterns:
         lines.extend(["", "<b>패턴 후보</b>"])
@@ -117,12 +132,22 @@ def build_analysis_message(analysis: MarketAnalysis, trigger: str | None = None)
     return message if len(message) <= 4000 else message[:3960] + "\n…(일부 설명 생략)"
 
 
-def build_hourly_summary_message(analyses: list[MarketAnalysis]) -> str:
+def build_hourly_summary_message(
+    analyses: list[MarketAnalysis],
+    sentiment: FearGreedSnapshot | None = None,
+) -> str:
     generated = datetime.now(UTC).astimezone(KST).strftime("%Y-%m-%d %H:%M")
     lines = [
         "🕐 <b>1시간 정기 차트 브리핑</b>",
         f"Binance 현물 시세 기준: {generated} KST",
     ]
+    if sentiment is not None:
+        lines.extend([
+            f"시장심리(BTC 중심): <b>{sentiment.value}/100 · {escape(sentiment.label)}</b> "
+            f"· 전일 {format_change(sentiment.change_1d)} · 7일 {format_change(sentiment.change_7d)}",
+            f"심리 해석: {escape(sentiment.guidance)}",
+            "출처: Alternative.me",
+        ])
 
     for analysis in analyses:
         symbol = analysis.symbol.removesuffix("USDT")
@@ -178,6 +203,7 @@ def build_ema_signal_message(
     signals: list[EmaSignal],
     *,
     tolerance_percent: float,
+    sentiment: FearGreedSnapshot | None = None,
 ) -> str:
     symbol = analysis.symbol.removesuffix("USDT")
     generated = datetime.now(UTC).astimezone(KST).strftime("%Y-%m-%d %H:%M")
@@ -187,6 +213,13 @@ def build_ema_signal_message(
         f"확인 시각: {generated} KST",
         "",
     ]
+    if sentiment is not None:
+        lines.extend([
+            f"시장심리(BTC 중심): <b>{sentiment.value}/100 · {escape(sentiment.label)}</b> "
+            f"· 7일 {format_change(sentiment.change_7d)}",
+            f"{escape(sentiment.guidance)} · 출처 Alternative.me",
+            "",
+        ])
 
     touches = [signal for signal in signals if signal.kind == "touch"]
     alignments = [signal for signal in signals if signal.kind == "alignment"]

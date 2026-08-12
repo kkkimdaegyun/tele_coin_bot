@@ -8,6 +8,7 @@ from analysis_report import build_analysis_message, build_ema_signal_message, bu
 from ema_chart import render_ema_chart_png
 from ema_signals import alignment_state, detect_ema_signals
 from investor_guidance import build_bottom_decision
+from sentiment_context import FearGreedSnapshot
 from market_data import Candle
 from storage import ChartTeacherStore
 
@@ -93,13 +94,25 @@ class AnalysisEngineTests(unittest.TestCase):
         analyses[0].current_price = 64_000
         analyses[1].current_price = 3_200
         analyses[2].current_price = 150
-        message = build_hourly_summary_message(analyses)
+        sentiment = FearGreedSnapshot(
+            value=27,
+            label="공포",
+            yesterday_value=29,
+            week_value=27,
+            change_1d=-2,
+            change_7d=0,
+            timestamp=1_800_000_000,
+            guidance="공포 구간 · 단독 매수 신호 아님",
+        )
+        message = build_hourly_summary_message(analyses, sentiment=sentiment)
         self.assertIn("1시간 정기 차트 브리핑", message)
         self.assertIn("BTC · 64K", message)
         self.assertIn("ETH · 3.2K", message)
         self.assertIn("SOL · 150", message)
         self.assertIn("한줄평:", message)
         self.assertIn("투자자 체크:", message)
+        self.assertIn("시장심리(BTC 중심)", message)
+        self.assertIn("출처: Alternative.me", message)
 
     def test_ema_touch_and_alignment_transition(self):
         sample = candles(260, step=0.2)

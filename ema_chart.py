@@ -14,6 +14,7 @@ from formatter import _fmt_price
 from investor_guidance import build_bottom_decision, build_investor_notices, investor_notice_line
 from market_data import BinanceMarketData, Candle
 from macro_context import MacroContext, get_macro_context
+from sentiment_context import FearGreedSnapshot, format_change, get_fear_greed
 from storage import ChartTeacherStore
 
 
@@ -39,6 +40,7 @@ async def build_ema_chart_image(
     *,
     analysis: MarketAnalysis | None = None,
     macro: MacroContext | None = None,
+    sentiment: FearGreedSnapshot | None = None,
     provider: BinanceMarketData | None = None,
     store: ChartTeacherStore | None = None,
 ) -> bytes:
@@ -64,6 +66,7 @@ async def build_ema_chart_image(
         scenario_interval = "4h" if "4h" in analysis.timeframes else next(iter(analysis.timeframes))
         datasets[scenario_interval] = store.load_candles(symbol, scenario_interval, limit=10000)
         macro = macro or await get_macro_context()
+        sentiment = sentiment or await get_fear_greed()
     return render_ema_chart_png(
         symbol,
         datasets,
@@ -71,6 +74,7 @@ async def build_ema_chart_image(
         signals,
         analysis=analysis,
         macro=macro,
+        sentiment=sentiment,
     )
 
 
@@ -78,6 +82,7 @@ async def build_market_overview_image(
     analysis: MarketAnalysis,
     *,
     macro: MacroContext | None = None,
+    sentiment: FearGreedSnapshot | None = None,
     provider: BinanceMarketData | None = None,
     store: ChartTeacherStore | None = None,
 ) -> bytes:
@@ -89,6 +94,7 @@ async def build_market_overview_image(
     recent = await provider.fetch_klines(analysis.symbol, primary, limit=2)
     live = recent[-1] if recent else None
     macro = macro or await get_macro_context()
+    sentiment = sentiment or await get_fear_greed()
     datasets = {primary: store.load_candles(analysis.symbol, primary, limit=10000)}
     if primary != "4h" and "4h" in analysis.timeframes:
         datasets["4h"] = store.load_candles(analysis.symbol, "4h", limit=10000)
@@ -99,6 +105,7 @@ async def build_market_overview_image(
         [],
         analysis=analysis,
         macro=macro,
+        sentiment=sentiment,
         intervals_override=[primary],
     )
 
@@ -106,11 +113,14 @@ async def build_market_overview_image(
 async def build_hourly_market_board_image(analyses: list[MarketAnalysis]) -> bytes:
     if not analyses:
         raise ValueError("At least one market analysis is required")
-    macro = await get_macro_context()
+    macro, sentiment = await asyncio.gather(get_macro_context(), get_fear_greed())
     images = [
         Image.open(BytesIO(image_bytes)).convert("RGB")
         for image_bytes in await asyncio.gather(
-            *(build_market_overview_image(analysis, macro=macro) for analysis in analyses)
+            *(
+                build_market_overview_image(analysis, macro=macro, sentiment=sentiment)
+                for analysis in analyses
+            )
         )
     ]
     gap = 12
@@ -134,6 +144,7 @@ def render_ema_chart_png(
     *,
     analysis: MarketAnalysis | None = None,
     macro: MacroContext | None = None,
+    sentiment: FearGreedSnapshot | None = None,
     intervals_override: list[str] | None = None,
 ) -> bytes:
     grouped: dict[str, list[EmaSignal]] = defaultdict(list)
@@ -148,7 +159,7 @@ def render_ema_chart_png(
         raise ValueError("At least one chart interval is required")
 
     width = 1200
-    header_height = 535 if analysis is not None else 116
+    header_height = 618 if analysis is not None else 116
     panel_height = 345
     scenario_height = 390 if analysis is not None else 0
     footer_height = 72
@@ -166,7 +177,7 @@ def render_ema_chart_png(
     generated = datetime.now(UTC).astimezone(KST).strftime("%Y-%m-%d %H:%M KST")
     draw.text((38, 74), f"Binance 현물 실제 캔들  ·  {generated}", font=small, fill=MUTED)
     if analysis is not None:
-        _draw_analysis_summary(draw, analysis, macro, small, tiny)
+        _draw_analysis_summary(draw, analysis, macro, sentiment, small, tiny)
 
     for index, interval in enumerate(intervals):
         top = header_height + index * panel_height
@@ -218,6 +229,7 @@ def _draw_analysis_summary(
     draw: ImageDraw.ImageDraw,
     analysis: MarketAnalysis,
     macro: MacroContext | None,
+    sentiment: FearGreedSnapshot | None,
     small: ImageFont.FreeTypeFont,
     tiny: ImageFont.FreeTypeFont,
 ) -> None:
@@ -319,17 +331,60 @@ def _draw_analysis_summary(
             notice_color,
             max_lines=1,
         )
+    if sentiment is not None:
+        sentiment_color = (
+            "#4dabf7" if sentiment.value <= 44
+            else "#ffd43b" if sentiment.value <= 55
+            else "#ff922b" if sentiment.value <= 74
+            else DOWN
+        )
+        draw.rounded_rectangle(
+            (36, 435, 1164, 505),
+            radius=10,
+            fill="#161d29",
+            outline=sentiment_color,
+            width=2,
+        )
+        heading = (
+            f"공포·탐욕 {sentiment.value}/100 · {sentiment.label} · "
+            f"전일 {format_change(sentiment.change_1d)} · 7일 {format_change(sentiment.change_7d)}"
+        )
+        draw.text((50, 443), heading, font=small, fill=sentiment_color)
+        attribution = "BTC 중심 · 출처 Alternative.me"
+        draw.text(
+            (1148 - draw.textlength(attribution, font=tiny), 446),
+            attribution,
+            font=tiny,
+            fill=MUTED,
+        )
+        _draw_wrapped_text(
+            draw,
+            sentiment.guidance,
+            (50, 475),
+            1085,
+            tiny,
+            TEXT,
+            max_lines=1,
+        )
+    else:
+        draw.text(
+            (36, 461),
+            "공포·탐욕 지수 일시 미수신 · 기술적 구조만 사용",
+            font=tiny,
+            fill=MUTED,
+        )
+
     if macro is not None:
         macro_color = UP if macro.score >= 65 else DOWN if macro.score <= 35 else "#ffd43b"
         draw.rounded_rectangle(
-            (36, 435, 1164, 518),
+            (36, 518, 1164, 601),
             radius=10,
             fill="#121d29",
             outline=macro_color,
             width=2,
         )
         draw.text(
-            (50, 444),
+            (50, 527),
             f"거시환경 {macro.regime} {macro.score}/100  ·  FRED 최신 영업일 자료",
             font=small,
             fill=macro_color,
@@ -345,9 +400,9 @@ def _draw_analysis_summary(
             value = _fmt_price(indicator.value) + indicator.unit
             impact_color = UP if indicator.impact > 0 else DOWN if indicator.impact < 0 else MUTED
             text = f"{short_labels[indicator.series_id]} {value} · 5d {change}"
-            draw.text((x, 481), text, font=tiny, fill=impact_color)
+            draw.text((x, 564), text, font=tiny, fill=impact_color)
     else:
-        draw.text((36, 465), "거시환경 데이터 일시 미수신 · 기술적 분석만 표시", font=tiny, fill=MUTED)
+        draw.text((36, 551), "거시환경 데이터 일시 미수신 · 기술적 분석만 표시", font=tiny, fill=MUTED)
 
 
 def _timeframe_state(timeframe: TimeframeAnalysis) -> tuple[str, str]:
