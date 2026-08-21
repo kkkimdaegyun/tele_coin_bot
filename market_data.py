@@ -27,6 +27,7 @@ class Candle:
     close: float
     volume: float
     close_time: int
+    taker_buy_volume: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -79,6 +80,7 @@ class BinanceMarketData:
                 close=float(row[4]),
                 volume=float(row[5]),
                 close_time=int(row[6]),
+                taker_buy_volume=float(row[9]),
             )
             for row in rows
         ]
@@ -162,6 +164,7 @@ def import_tradingview_csv(path: Path, interval: str) -> list[Candle]:
                         close=float(normalized["close"]),
                         volume=float(normalized.get("volume") or 0),
                         close_time=opened + INTERVAL_MS[interval] - 1,
+                        taker_buy_volume=None,
                     )
                 )
             except (KeyError, TypeError, ValueError):

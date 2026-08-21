@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 
 from analysis_engine import ema
@@ -19,6 +18,7 @@ class EmaSignal:
     ema_period: int | None = None
     ema_value: float | None = None
     alignment: str | None = None
+    reaction: str | None = None
 
 
 def alignment_state(ema20: float | None, ema50: float | None, ema200: float | None) -> str:
@@ -40,6 +40,8 @@ def detect_ema_signals(
     signals: list[EmaSignal] = []
     tolerance = max(0.0, min(float(tolerance_percent), 1.0)) / 100.0
 
+    touch_intervals = {"1h", "4h"}
+    alignment_intervals = {"1h", "4h", "1d"}
     for interval in TIMEFRAMES:
         candles = datasets.get(interval, [])
         if len(candles) < 202:
@@ -55,7 +57,11 @@ def detect_ema_signals(
         previous_alignment = alignment_state(
             ema20_values[-2], ema50_values[-2], ema200_values[-2]
         )
-        if current_alignment in {"bullish", "bearish"} and current_alignment != previous_alignment:
+        if (
+            interval in alignment_intervals
+            and current_alignment in {"bullish", "bearish"}
+            and current_alignment != previous_alignment
+        ):
             korean = "정배열" if current_alignment == "bullish" else "역배열"
             signals.append(
                 EmaSignal(
@@ -68,9 +74,9 @@ def detect_ema_signals(
                 )
             )
 
-        live = live_candles.get(interval)
-        if live is None:
+        if interval not in touch_intervals:
             continue
+        confirmed = candles[-1]
         for period, level in (
             (20, ema20_values[-1]),
             (50, ema50_values[-1]),
@@ -78,17 +84,23 @@ def detect_ema_signals(
         ):
             if level is None:
                 continue
-            touched = live.low <= level * (1.0 + tolerance) and live.high >= level * (1.0 - tolerance)
+            touched = (
+                confirmed.low <= level * (1.0 + tolerance)
+                and confirmed.high >= level * (1.0 - tolerance)
+            )
             if touched:
+                reaction = "closed_above" if confirmed.close >= level else "closed_below"
+                reaction_label = "위 마감" if reaction == "closed_above" else "아래 마감"
                 signals.append(
                     EmaSignal(
-                        event=f"ema_{period}_touch",
+                        event=f"ema_{period}_touch_{reaction}",
                         interval=interval,
-                        bar_open_time=live.open_time,
+                        bar_open_time=confirmed.open_time,
                         kind="touch",
-                        description=f"EMA {period} 터치",
+                        description=f"EMA {period} 접촉 후 {reaction_label}",
                         ema_period=period,
                         ema_value=float(level),
+                        reaction=reaction,
                     )
                 )
     return signals
@@ -109,14 +121,8 @@ async def collect_ema_signals(
         for interval in TIMEFRAMES
     }
 
-    async def fetch_live(interval: str) -> tuple[str, Candle | None]:
-        candles = await provider.fetch_klines(symbol, interval, limit=2)
-        return interval, candles[-1] if candles else None
-
-    results = await asyncio.gather(*(fetch_live(interval) for interval in TIMEFRAMES))
-    live_candles = {interval: candle for interval, candle in results if candle is not None}
     return detect_ema_signals(
         datasets,
-        live_candles,
+        {},
         tolerance_percent=tolerance_percent,
     )

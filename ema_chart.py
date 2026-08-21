@@ -9,13 +9,22 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 from analysis_engine import MarketAnalysis, TimeframeAnalysis, ema
+from entry_strategy import (
+    capital_action_line,
+    capital_plan_line,
+    entry_headline,
+    evaluate_entry,
+)
 from ema_signals import EmaSignal
 from formatter import _fmt_price
-from investor_guidance import build_bottom_decision, build_investor_notices, investor_notice_line
+from indicator_summary import price_ema20_position, rsi_zone
+from investor_guidance import build_investor_notices, investor_notice_line
 from market_data import BinanceMarketData, Candle
 from macro_context import MacroContext, get_macro_context
+from pattern_education import pattern_one_line
 from sentiment_context import FearGreedSnapshot, format_change, get_fear_greed
 from storage import ChartTeacherStore
+from wave_context import wave_summary
 
 
 KST = timezone(timedelta(hours=9))
@@ -159,9 +168,9 @@ def render_ema_chart_png(
         raise ValueError("At least one chart interval is required")
 
     width = 1200
-    header_height = 618 if analysis is not None else 116
+    header_height = 750 if analysis is not None else 116
     panel_height = 345
-    scenario_height = 390 if analysis is not None else 0
+    scenario_height = 440 if analysis is not None else 0
     footer_height = 72
     height = header_height + panel_height * len(intervals) + scenario_height + footer_height
     image = Image.new("RGB", (width, height), BACKGROUND)
@@ -172,7 +181,13 @@ def render_ema_chart_png(
     panel_title = _font(27, bold=True)
 
     coin = symbol.upper().removesuffix("USDT")
-    heading = f"{coin}  트레이더 한눈 요약" if analysis else f"{coin}  EMA 터치 · 배열 차트"
+    if analysis is not None:
+        heading = entry_headline(symbol, evaluate_entry(analysis))
+        # Windows' bundled Korean font has no color-emoji glyph. Telegram text
+        # keeps the icon, while the rendered image uses the clean text title.
+        heading = heading.split(" ", 1)[1] if " " in heading else heading
+    else:
+        heading = f"{coin}  EMA 터치 · 배열 차트"
     draw.text((36, 24), heading, font=title_font, fill=TEXT)
     generated = datetime.now(UTC).astimezone(KST).strftime("%Y-%m-%d %H:%M KST")
     draw.text((38, 74), f"Binance 현물 실제 캔들  ·  {generated}", font=small, fill=MUTED)
@@ -237,7 +252,13 @@ def _draw_analysis_summary(
     price = f"현재 {_fmt_price(analysis.current_price)}"
     draw.text((1160 - draw.textlength(price, font=price_font), 28), price, font=price_font, fill=TEXT)
 
-    box_y = 112
+    draw.text(
+        (36, 105),
+        "핵심 3종 · RSI / EMA 배열 / 가격의 EMA20 위치",
+        font=tiny,
+        fill=MUTED,
+    )
+    box_y = 130
     box_width = 270
     for index, interval in enumerate(("1d", "4h", "1h", "15m")):
         timeframe = analysis.timeframes.get(interval)
@@ -246,16 +267,24 @@ def _draw_analysis_summary(
         state, state_color = _timeframe_state(timeframe)
         x = 36 + index * 286
         draw.rounded_rectangle(
-            (x, box_y, x + box_width, box_y + 51),
+            (x, box_y, x + box_width, box_y + 74),
             radius=10,
             fill="#172231",
             outline=state_color,
             width=3,
         )
         label = f"{TIMEFRAME_LABELS[interval]}  {state}"
-        draw.text((x + 12, box_y + 10), label, font=small, fill=state_color)
+        draw.text((x + 12, box_y + 7), label, font=small, fill=state_color)
+        rsi_text = "RSI -" if timeframe.rsi is None else f"RSI {timeframe.rsi:.0f} {rsi_zone(timeframe.rsi)}"
+        position_text = price_ema20_position(timeframe).replace("가격 ", "")
+        draw.text(
+            (x + 12, box_y + 42),
+            f"{rsi_text} · {position_text}",
+            font=tiny,
+            fill=TEXT,
+        )
 
-    score_y = 181
+    score_y = 220
     score_items = [
         ("방향", analysis.direction_score, UP if analysis.direction_score >= 55 else DOWN if analysis.direction_score <= 45 else "#ffd43b"),
         ("신호 강도", analysis.signal_strength, "#b197fc"),
@@ -275,20 +304,21 @@ def _draw_analysis_summary(
 
     detail = analysis.timeframes.get("4h") or next(iter(analysis.timeframes.values()))
     volume_text = "-" if detail.volume_ratio is None else f"{(detail.volume_ratio - 1) * 100:+.0f}%"
+    buy_text = "-" if detail.taker_buy_ratio is None else f"{detail.taker_buy_ratio * 100:.0f}%"
     macd_text = "-"
     if detail.macd is not None and detail.macd_signal is not None:
         macd_text = "상승" if detail.macd > detail.macd_signal else "하락"
     metrics = (
-        f"4H RSI {detail.rsi:.1f}  ·  거래량 {volume_text}  ·  "
+        f"4H RSI {detail.rsi:.1f}  ·  거래량 {volume_text}  ·  체결매수 {buy_text}  ·  "
         f"MACD {macd_text}  ·  {_ema_order_text(detail)}"
     ) if detail.rsi is not None else (
-        f"4H RSI -  ·  거래량 {volume_text}  ·  MACD {macd_text}  ·  {_ema_order_text(detail)}"
+        f"4H RSI -  ·  거래량 {volume_text}  ·  체결매수 {buy_text}  ·  MACD {macd_text}  ·  {_ema_order_text(detail)}"
     )
-    draw.text((36, 226), metrics, font=small, fill=TEXT)
+    draw.text((36, 263), metrics, font=small, fill=TEXT)
     support = _fmt_price(detail.support) if detail.support is not None else "-"
     resistance = _fmt_price(detail.resistance) if detail.resistance is not None else "-"
     draw.text(
-        (36, 263),
+        (36, 300),
         f"지지 {support}  ·  저항 {resistance}",
         font=small,
         fill="#cbd5e1",
@@ -302,21 +332,72 @@ def _draw_analysis_summary(
         )
     else:
         pattern_text = "패턴 현재 뚜렷한 후보 없음"
-    draw.text((400, 263), pattern_text, font=small, fill="#f8d477")
-    bottom = build_bottom_decision(analysis)
-    bottom_color = UP if bottom.confirmation_ready else "#ffd43b" if bottom.score >= 50 else DOWN
-    bottom_rule = (
-        f"바닥 룰  {bottom.score}/100 · 확률 아님 · {bottom.stage} — {bottom.action}"
+    draw.text((400, 300), pattern_text, font=small, fill="#f8d477")
+    pattern_guide = (
+        "패턴 설명  " + pattern_one_line(pattern["name"], pattern["status"])
+        if pattern
+        else "패턴 설명  현재는 설명할 만한 뚜렷한 패턴이 없습니다."
     )
-    _draw_wrapped_text(draw, bottom_rule, (36, 297), 1120, tiny, bottom_color, max_lines=1)
+    _draw_wrapped_text(draw, pattern_guide, (36, 332), 1120, tiny, "#f8d477", max_lines=1)
+    entry = evaluate_entry(analysis)
+    entry_color = (
+        UP if entry.action == "first_entry_review"
+        else "#ffd43b" if entry.action == "watch"
+        else DOWN if entry.action == "wait_pullback"
+        else MUTED
+    )
+    entry_rule = (
+        f"진입 판단  {entry.action_label} · 조건 {entry.score}/100(확률 아님) — "
+        f"{entry.setup} · {entry.explanation}"
+    )
+    _draw_wrapped_text(draw, entry_rule, (36, 361), 1120, tiny, entry_color, max_lines=1)
+    capital_text = "자금 계획  " + capital_action_line(entry)
+    full_plan = capital_plan_line(entry)
+    if full_plan:
+        capital_text += " · " + full_plan
+    _draw_wrapped_text(
+        draw,
+        capital_text,
+        (36, 390),
+        1120,
+        tiny,
+        "#ffd43b" if entry.action != "first_entry_review" else UP,
+        max_lines=1,
+    )
+    dominance = analysis.dominance_context or {}
+    if dominance.get("value") is not None:
+        regime = dominance.get("regime")
+        dominance_color = (
+            UP if regime in {"risk_on", "supportive"}
+            else DOWN if regime in {"risk_off", "cautious"}
+            else MUTED
+        )
+        change = dominance.get("change_24h_pp")
+        change_text = "수집 중" if change is None else f"{float(change):+.2f}%p"
+        dominance_text = (
+            f"USDT.D 시장 필터  {float(dominance['value']):.2f}% · "
+            f"24h {change_text} · {dominance.get('label', '중립')} — "
+            "시장 환경 필터이며 단독 매수·추격 근거 아님"
+        )
+        _draw_wrapped_text(
+            draw,
+            dominance_text,
+            (36, 419),
+            1120,
+            tiny,
+            dominance_color,
+            max_lines=1,
+        )
+    else:
+        draw.text((36, 419), "USDT.D 시장 필터 데이터 수집 중", font=tiny, fill=MUTED)
     conclusion = "한줄 결론  " + _analysis_one_line(analysis, detail)
-    _draw_wrapped_text(draw, conclusion, (36, 326), 1120, tiny, TEXT, max_lines=2)
+    _draw_wrapped_text(draw, conclusion, (36, 448), 1120, tiny, TEXT, max_lines=2)
     notices = build_investor_notices(analysis, detail, limit=1)
     if notices:
         notice = notices[0]
         notice_color = DOWN if notice.level == "risk" else "#ffd43b" if notice.level == "caution" else "#4dabf7"
         draw.rounded_rectangle(
-            (36, 382, 1164, 424),
+            (36, 503, 1164, 545),
             radius=8,
             fill="#1b2029",
             outline=notice_color,
@@ -325,7 +406,7 @@ def _draw_analysis_summary(
         _draw_wrapped_text(
             draw,
             "투자자 체크  " + investor_notice_line(notice),
-            (50, 391),
+            (50, 512),
             1095,
             tiny,
             notice_color,
@@ -339,7 +420,7 @@ def _draw_analysis_summary(
             else DOWN
         )
         draw.rounded_rectangle(
-            (36, 435, 1164, 505),
+            (36, 558, 1164, 628),
             radius=10,
             fill="#161d29",
             outline=sentiment_color,
@@ -349,10 +430,10 @@ def _draw_analysis_summary(
             f"공포·탐욕 {sentiment.value}/100 · {sentiment.label} · "
             f"전일 {format_change(sentiment.change_1d)} · 7일 {format_change(sentiment.change_7d)}"
         )
-        draw.text((50, 443), heading, font=small, fill=sentiment_color)
+        draw.text((50, 566), heading, font=small, fill=sentiment_color)
         attribution = "BTC 중심 · 출처 Alternative.me"
         draw.text(
-            (1148 - draw.textlength(attribution, font=tiny), 446),
+            (1148 - draw.textlength(attribution, font=tiny), 569),
             attribution,
             font=tiny,
             fill=MUTED,
@@ -360,7 +441,7 @@ def _draw_analysis_summary(
         _draw_wrapped_text(
             draw,
             sentiment.guidance,
-            (50, 475),
+            (50, 598),
             1085,
             tiny,
             TEXT,
@@ -368,7 +449,7 @@ def _draw_analysis_summary(
         )
     else:
         draw.text(
-            (36, 461),
+            (36, 584),
             "공포·탐욕 지수 일시 미수신 · 기술적 구조만 사용",
             font=tiny,
             fill=MUTED,
@@ -377,14 +458,14 @@ def _draw_analysis_summary(
     if macro is not None:
         macro_color = UP if macro.score >= 65 else DOWN if macro.score <= 35 else "#ffd43b"
         draw.rounded_rectangle(
-            (36, 518, 1164, 601),
+            (36, 641, 1164, 724),
             radius=10,
             fill="#121d29",
             outline=macro_color,
             width=2,
         )
         draw.text(
-            (50, 527),
+            (50, 650),
             f"거시환경 {macro.regime} {macro.score}/100  ·  FRED 최신 영업일 자료",
             font=small,
             fill=macro_color,
@@ -400,9 +481,9 @@ def _draw_analysis_summary(
             value = _fmt_price(indicator.value) + indicator.unit
             impact_color = UP if indicator.impact > 0 else DOWN if indicator.impact < 0 else MUTED
             text = f"{short_labels[indicator.series_id]} {value} · 5d {change}"
-            draw.text((x, 564), text, font=tiny, fill=impact_color)
+            draw.text((x, 687), text, font=tiny, fill=impact_color)
     else:
-        draw.text((36, 551), "거시환경 데이터 일시 미수신 · 기술적 분석만 표시", font=tiny, fill=MUTED)
+        draw.text((36, 674), "거시환경 데이터 일시 미수신 · 기술적 분석만 표시", font=tiny, fill=MUTED)
 
 
 def _timeframe_state(timeframe: TimeframeAnalysis) -> tuple[str, str]:
@@ -607,9 +688,17 @@ def _draw_panel(
         if len(points) >= 2:
             draw.line(points, fill=EMA_COLORS[period], width=3 if period != 200 else 4, joint="curve")
 
-    last_x = x_of(len(visible) - 1)
     touch_signals = [signal for signal in signals if signal.kind == "touch" and signal.ema_value]
     for signal_index, signal in enumerate(touch_signals):
+        signal_position = next(
+            (
+                index
+                for index, candle in enumerate(visible)
+                if candle.open_time == signal.bar_open_time
+            ),
+            len(visible) - 1,
+        )
+        signal_x = x_of(signal_position)
         level_y = y_of(float(signal.ema_value))
         color = EMA_COLORS.get(signal.ema_period or 20, TEXT)
         radius = 10 + signal_index * 2
@@ -617,25 +706,25 @@ def _draw_panel(
         outer_radius = radius + 7
         draw.ellipse(
             (
-                last_x - outer_radius,
+                signal_x - outer_radius,
                 level_y - outer_radius,
-                last_x + outer_radius,
+                signal_x + outer_radius,
                 level_y + outer_radius,
             ),
             outline="#ff3b30",
             width=5,
         )
         draw.ellipse(
-            (last_x - radius, level_y - radius, last_x + radius, level_y + radius),
+            (signal_x - radius, level_y - radius, signal_x + radius, level_y + radius),
             outline="#ffffff",
             fill=color,
             width=4,
         )
-        guide_start = max(chart_left, last_x - step * 12)
+        guide_start = max(chart_left, signal_x - step * 12)
         _dashed_line(draw, (guide_start, level_y), (chart_right, level_y), color)
         label = f"EMA{signal.ema_period}  {_fmt_price(signal.ema_value)}"
         label_width = draw.textlength(label, font=tiny) + 18
-        label_x = min(chart_right - label_width, max(chart_left, last_x - label_width - 18))
+        label_x = min(chart_right - label_width, max(chart_left, signal_x - label_width - 18))
         label_y = max(chart_top, min(chart_bottom - 28, level_y - 32 - signal_index * 28))
         draw.rounded_rectangle(
             (label_x, label_y, label_x + label_width, label_y + 25),
@@ -650,9 +739,18 @@ def _draw_panel(
         primary = max(touch_signals, key=lambda item: item.ema_period or 0)
         primary_level = float(primary.ema_value)
         primary_y = y_of(primary_level)
-        above = current >= primary_level
-        status = "지지 확인 중" if above else "이탈·회복 확인 중"
-        condition = "이 시간봉 선 위 마감 = 지지" if above else "이 시간봉 선 회복 = 이탈 실패"
+        primary_position = next(
+            (
+                index
+                for index, candle in enumerate(visible)
+                if candle.open_time == primary.bar_open_time
+            ),
+            len(visible) - 1,
+        )
+        primary_x = x_of(primary_position)
+        above = primary.reaction == "closed_above"
+        status = "지지 반응 확인" if above else "저항·이탈 반응"
+        condition = "확정봉 선 위 마감" if above else "확정봉 선 아래 마감"
         callout_x = chart_left + 14
         callout_y = chart_top + 10
         callout_width = 322
@@ -671,7 +769,7 @@ def _draw_panel(
         )
         draw.text(
             (callout_x + 13, callout_y + 6),
-            f"EMA{primary.ema_period} 터치 · {status}",
+            f"EMA{primary.ema_period} 접촉 · {status}",
             font=small,
             fill="#ffb3ba",
         )
@@ -682,7 +780,7 @@ def _draw_panel(
             fill=TEXT,
         )
         arrow_start = (callout_x + callout_width, callout_y + callout_height / 2)
-        arrow_end = (last_x - 22, primary_y)
+        arrow_end = (primary_x - 22, primary_y)
         draw.line((*arrow_start, *arrow_end), fill="#ff3b30", width=3)
         draw.polygon(
             [
@@ -756,7 +854,9 @@ def _draw_scenario_panel(
         return
 
     chart_left, chart_top = left + 44, top + 72
-    chart_right, chart_bottom = right - 260, bottom - 82
+    # Reserve a dedicated two-line footer inside the scenario panel so the
+    # wave/Fibonacci note never sits on top of the chart axis labels.
+    chart_right, chart_bottom = right - 260, bottom - 132
     all_values = list(current_values)
     for _, values in paths:
         all_values.extend(values)
@@ -813,12 +913,18 @@ def _draw_scenario_panel(
         legend_y += 68
 
     detail = analysis.timeframes.get("4h") or next(iter(analysis.timeframes.values()))
-    condition_y = bottom - 39
+    condition_y = bottom - 43
     support = _fmt_price(detail.support) if detail.support is not None else "-"
     resistance = _fmt_price(detail.resistance) if detail.resistance is not None else "-"
     condition = (
         f"상방 조건: 저항 {resistance} 종가 돌파+거래량  ·  "
         f"하방 위험: 지지 {support} 종가 이탈"
+    )
+    draw.text(
+        (left + 24, condition_y - 36),
+        "파동·피보나치  " + wave_summary(analysis.wave_context),
+        font=tiny,
+        fill="#f8d477",
     )
     draw.text((left + 24, condition_y), condition, font=tiny, fill="#cbd5e1")
 

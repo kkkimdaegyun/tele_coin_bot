@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 
 from market_data import Candle
+from wave_context import analyze_wave_context
 
 
 @dataclass
@@ -23,13 +24,20 @@ class TimeframeAnalysis:
     structure: str
     close: float
     rsi: float | None
+    rsi_previous: float | None
+    change_24h: float | None
     ema20: float | None
     ema50: float | None
     ema200: float | None
     volume_ratio: float | None
+    taker_buy_ratio: float | None
+    taker_buy_ratio_5: float | None
     macd: float | None
     macd_signal: float | None
     atr_percent: float | None
+    ema20_distance_percent: float | None
+    breakout_20: bool
+    ema20_touched: bool
     support: float | None
     resistance: float | None
     direction_score: int
@@ -60,6 +68,8 @@ class MarketAnalysis:
     timeframes: dict[str, TimeframeAnalysis]
     important_patterns: list[dict]
     analogs: list[HistoricalAnalog]
+    wave_context: dict | None
+    dominance_context: dict | None
     warnings: list[str]
 
     def to_dict(self) -> dict:
@@ -153,6 +163,8 @@ def analyze_timeframe(interval: str, candles: list[Candle]) -> TimeframeAnalysis
     structure = _structure(highs, lows)
     volume_average = statistics.fmean([candle.volume for candle in candles[-21:-1]])
     volume_ratio = current.volume / volume_average if volume_average else None
+    taker_buy_ratio = _taker_buy_ratio([current])
+    taker_buy_ratio_5 = _taker_buy_ratio(candles[-5:])
     atr_value = atr(candles)
     support, resistance = _support_resistance(current.close, highs, lows)
     patterns = _detect_patterns(candles, highs, lows, rsi_series)
@@ -179,18 +191,42 @@ def analyze_timeframe(interval: str, candles: list[Candle]) -> TimeframeAnalysis
         structure,
     )
     invalidation = _invalidation(current.close, support, resistance, score)
+    lookback_24h = {"15m": 96, "1h": 24, "4h": 6, "1d": 1}.get(interval, 24)
+    change_24h = (
+        (current.close / candles[-lookback_24h - 1].close - 1) * 100
+        if len(candles) > lookback_24h
+        else None
+    )
+    prior_highs = [candle.high for candle in candles[-21:-1]]
+    breakout_20 = bool(prior_highs and current.close > max(prior_highs))
+    current_ema20 = ema20_series[-1]
+    ema20_touched = bool(
+        current_ema20 is not None
+        and current.low <= current_ema20 * 1.001
+        and current.high >= current_ema20 * 0.999
+    )
     return TimeframeAnalysis(
         interval=interval,
         structure=structure,
         close=current.close,
         rsi=_rounded(rsi_series[-1]),
+        rsi_previous=_rounded(rsi_series[-2]),
+        change_24h=_rounded(change_24h, 2),
         ema20=_rounded(ema20_series[-1]),
         ema50=_rounded(ema50_series[-1]),
         ema200=_rounded(ema200_series[-1]),
         volume_ratio=_rounded(volume_ratio, 3),
+        taker_buy_ratio=_rounded(taker_buy_ratio, 4),
+        taker_buy_ratio_5=_rounded(taker_buy_ratio_5, 4),
         macd=_rounded(macd_line[-1]),
         macd_signal=_rounded(macd_signal_line[-1]),
         atr_percent=_rounded((atr_value / current.close * 100) if atr_value else None, 2),
+        ema20_distance_percent=_rounded(
+            ((current.close / current_ema20 - 1) * 100) if current_ema20 else None,
+            2,
+        ),
+        breakout_20=breakout_20,
+        ema20_touched=ema20_touched,
         support=_rounded(support),
         resistance=_rounded(resistance),
         direction_score=score,
@@ -199,6 +235,21 @@ def analyze_timeframe(interval: str, candles: list[Candle]) -> TimeframeAnalysis
         reasons=reasons[:5],
         invalidation=invalidation,
     )
+
+
+def _taker_buy_ratio(candles: list[Candle]) -> float | None:
+    available = [
+        candle
+        for candle in candles
+        if candle.taker_buy_volume is not None and candle.volume > 0
+    ]
+    if not available:
+        return None
+    total_volume = sum(candle.volume for candle in available)
+    if total_volume <= 0:
+        return None
+    ratio = sum(float(candle.taker_buy_volume) for candle in available) / total_volume
+    return max(0.0, min(ratio, 1.0))
 
 
 def analyze_market(symbol: str, datasets: dict[str, list[Candle]]) -> MarketAnalysis:
@@ -233,6 +284,7 @@ def analyze_market(symbol: str, datasets: dict[str, list[Candle]]) -> MarketAnal
     signal_strength = min(100, round(agreement * 0.45 + abs(direction_score - 50) * 1.1))
     primary_interval = "4h" if "4h" in datasets else order[0]
     analogs = find_historical_analogs(datasets[primary_interval])
+    wave = analyze_wave_context(datasets[primary_interval])
     current_price = analyses[order[-1]].close
     warnings = [
         "패턴과 과거 유사도는 확률적 참고자료이며 미래 가격을 보장하지 않습니다.",
@@ -249,6 +301,8 @@ def analyze_market(symbol: str, datasets: dict[str, list[Candle]]) -> MarketAnal
         timeframes=analyses,
         important_patterns=important,
         analogs=analogs,
+        wave_context=asdict(wave) if wave else None,
+        dominance_context=None,
         warnings=warnings,
     )
 
