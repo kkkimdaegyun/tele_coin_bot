@@ -6,7 +6,7 @@ import os
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta, timezone
 
-from analysis_engine import MarketAnalysis
+from analysis_engine import MarketAnalysis, analyze_timeframe
 from analysis_report import (
     build_analysis_message,
     build_compact_analysis_caption,
@@ -19,17 +19,28 @@ from analysis_service import SUPPORTED_SYMBOLS, analyze_symbol
 from dominance_context import UsdtDominanceSnapshot, get_usdt_dominance
 from ema_chart import build_ema_chart_image, build_market_overview_image
 from ema_signals import collect_ema_signals
-from entry_strategy import evaluate_entry
+from entry_strategy import capital_guidance_enabled, capital_plan_for_symbol, evaluate_entry
+from entry_strategy import format_krw
 from indicator_summary import core_indicator_line
+from market_data import BinanceMarketData, closed_candles
+from position_manager import evaluate_position, position_change_percent
 from sentiment_context import get_fear_greed
 from storage import ChartTeacherStore
 from telegram_client import send_telegram, send_telegram_photo
+from weekly_strategy import evaluate_weekly_cycle
+from strategy_universe import ACTIVE_MONITOR_SYMBOLS, is_market_context_symbol, is_trade_symbol
 
 
 log = logging.getLogger("chart-teacher-monitor")
-DEFAULT_MONITOR_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+DEFAULT_MONITOR_SYMBOLS = ACTIVE_MONITOR_SYMBOLS
 KST = timezone(timedelta(hours=9))
 _RECENT_ALERT_IMAGES: dict[str, int] = {}
+
+
+def _position_price(value: float) -> str:
+    if value >= 1_000:
+        return f"{value / 1_000:.2f}".rstrip("0").rstrip(".") + "K"
+    return f"{value:,.4f}".rstrip("0").rstrip(".")
 
 
 def _mark_recent_alert_image(symbol: str, now_ms: int | None = None) -> None:
@@ -64,7 +75,11 @@ def quiet_hours_active(now: datetime | None = None) -> bool:
 def configured_symbols() -> list[str]:
     raw = os.getenv("MONITOR_SYMBOLS", ",".join(DEFAULT_MONITOR_SYMBOLS))
     requested = [item.strip().upper() for item in raw.split(",") if item.strip()]
-    return [symbol for symbol in requested if symbol in SUPPORTED_SYMBOLS]
+    return [
+        symbol
+        for symbol in requested
+        if symbol in SUPPORTED_SYMBOLS and symbol in ACTIVE_MONITOR_SYMBOLS
+    ]
 
 
 async def scan_dominance_and_notify(snapshot: UsdtDominanceSnapshot | None) -> bool:
@@ -124,7 +139,68 @@ async def scan_dominance_and_notify(snapshot: UsdtDominanceSnapshot | None) -> b
     return True
 
 
+async def scan_weekly_cycle_and_notify(symbol: str) -> bool:
+    if not is_trade_symbol(symbol):
+        return False
+    provider = BinanceMarketData()
+    candles = closed_candles(await provider.fetch_klines(symbol, "1w", limit=300))
+    if len(candles) < 30:
+        return False
+    store = ChartTeacherStore()
+    store.upsert_candles(symbol, "1w", candles)
+    detail = analyze_timeframe("1w", candles)
+    decision = evaluate_weekly_cycle(detail)
+    if decision.action == "wait":
+        return False
+    critical = decision.action == "sell_candidate"
+    if quiet_hours_active() and not critical:
+        return False
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    payload = {
+        "symbol": symbol,
+        "event": f"weekly:{decision.action}",
+        "bar": candles[-1].open_time,
+    }
+    if not store.claim_signal(symbol, payload, now_ms):
+        return False
+    coin = symbol.removesuffix("USDT")
+    color = "🟢" if decision.action == "buy_candidate" else "🔴"
+    plan = capital_plan_for_symbol(symbol)
+    action = (
+        (
+            f"주봉은 큰 매집 후보 구간입니다. 전액 진입하지 말고 일봉 회복과 상대강도 확인 뒤 "
+            f"1차 예산 상한 {format_krw(plan.first_krw)}을 검토합니다."
+            if capital_guidance_enabled()
+            else "주봉은 관찰 후보입니다. 사이클 조건과 손실 한도 검증 전에는 실행 금액 안내를 잠급니다."
+        )
+        if decision.action == "buy_candidate"
+        else "주봉 추세가 약해졌습니다. 신규매수보다 보유분 축소·보호 기준을 먼저 확인합니다."
+    )
+    message = "\n".join(
+        [
+            f"{color} <b>{coin} · {decision.label}</b>",
+            f"확정 주봉 조건 {decision.score}/100(확률 아님)",
+            "",
+            "<b>근거</b>",
+            *[f"• {reason}" for reason in decision.reasons[:4]],
+            "",
+            f"<b>행동</b>\n{action}",
+            "",
+            "진행 중인 주봉은 사용하지 않으며 다음 주봉 마감 전에는 이 신호가 바뀌지 않습니다.",
+        ]
+    )
+    try:
+        await send_telegram(message)
+    except Exception:
+        store.release_signal(payload)
+        raise
+    log.info("Weekly cycle alert sent: symbol=%s action=%s", symbol, decision.action)
+    return True
+
+
 async def scan_and_notify(symbol: str, analysis: MarketAnalysis | None = None) -> bool:
+    if not is_trade_symbol(symbol):
+        return False
     analysis = analysis or await analyze_symbol(symbol)
     significant = _significant_signal(analysis)
     if significant is None:
@@ -213,6 +289,71 @@ async def scan_and_notify(symbol: str, analysis: MarketAnalysis | None = None) -
     return True
 
 
+async def scan_position_and_notify(symbol: str, analysis: MarketAnalysis) -> bool:
+    if not is_trade_symbol(symbol):
+        return False
+    store = ChartTeacherStore()
+    position = store.load_open_position(symbol)
+    if position is None:
+        return False
+    decision = evaluate_position(analysis, position)
+    if decision.action == "hold":
+        return False
+    if quiet_hours_active() and not decision.critical:
+        log.info("Position alert suppressed during quiet hours: symbol=%s", symbol)
+        return False
+
+    interval = "15m" if decision.action == "second_entry_review" else "4h"
+    candles = store.load_candles(symbol, interval, limit=1)
+    if not candles:
+        return False
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    fingerprint_payload = {
+        "symbol": symbol,
+        "event": f"position:{decision.action}",
+        "stage": int(position["stage"]),
+        "bar": candles[-1].open_time,
+    }
+    if not store.claim_signal(symbol, fingerprint_payload, now_ms):
+        return False
+    cooldown_hours = 1.0 if decision.critical else 4.0
+    cooldown_key = f"position:{symbol}:{decision.action}:stage{position['stage']}"
+    if not store.claim_cooldown(
+        cooldown_key,
+        now_ms,
+        int(cooldown_hours * 60 * 60 * 1000),
+    ):
+        return False
+
+    coin = symbol.removesuffix("USDT")
+    current = analysis.current_price
+    average = float(position["average_entry_price"])
+    change = position_change_percent(position, current)
+    invalidation = position.get("invalidation_price")
+    lines = [
+        f"🧭 <b>{coin} 보유관리 · {decision.label}</b>",
+        f"현재 {_position_price(current)} · 평균 {_position_price(average)} · 가격 변화 {change:+.2f}%",
+        f"누적 {format_krw(position['invested_krw'])} · {position['stage']}차 기록",
+    ]
+    if invalidation is not None:
+        lines.append(f"보호 기준 약 {_position_price(float(invalidation))}")
+    lines.extend(["", f"<b>판단 이유</b>\n{decision.reason}"])
+    if decision.amount_krw > 0:
+        lines.append(
+            f"\n실제 추가매수 후 <code>{coin} 추가매수 "
+            f"{format_krw(decision.amount_krw)} 가격</code>으로 기록하세요."
+        )
+    lines.append("\n자동 주문은 실행하지 않습니다.")
+    try:
+        await send_telegram("\n".join(lines))
+    except Exception:
+        store.release_signal(fingerprint_payload)
+        store.release_cooldown(cooldown_key, now_ms)
+        raise
+    log.info("Position alert sent: symbol=%s action=%s", symbol, decision.action)
+    return True
+
+
 async def send_hourly_summary(
     analyses: list[MarketAnalysis],
     *,
@@ -221,12 +362,15 @@ async def send_hourly_summary(
     if not analyses:
         return False
     if quiet_hours_active():
-        log.info("Hourly summary suppressed during quiet hours")
+        log.info("Periodic summary suppressed during quiet hours")
         return False
     now = datetime.now(UTC)
+    interval_hours = max(1, int(os.getenv("SUMMARY_INTERVAL_HOURS", "24")))
+    period_bucket = int(now.timestamp()) // (interval_hours * 60 * 60)
     fingerprint_payload = {
-        "event": "hourly_summary",
-        "hour_utc": now.strftime("%Y-%m-%dT%H"),
+        "event": "periodic_summary",
+        "period_bucket": period_bucket,
+        "interval_hours": interval_hours,
         "symbols": sorted(analysis.symbol for analysis in analyses),
     }
     store = ChartTeacherStore()
@@ -236,14 +380,23 @@ async def send_hourly_summary(
 
     sentiment = await get_fear_greed()
     skip_images = set(skip_image_symbols or ())
+    skip_images.update(
+        analysis.symbol for analysis in analyses if is_market_context_symbol(analysis.symbol)
+    )
     try:
         for analysis in analyses:
+            if is_market_context_symbol(analysis.symbol):
+                log.info(
+                    "Market-context image skipped; text summary retained: symbol=%s",
+                    analysis.symbol,
+                )
+                continue
             if analysis.symbol in skip_images or _recent_alert_image_active(
                 analysis.symbol,
                 now_ms,
             ):
                 log.info(
-                    "Hourly duplicate image skipped: symbol=%s",
+                    "Periodic duplicate image skipped: symbol=%s",
                     analysis.symbol,
                 )
                 continue
@@ -255,14 +408,14 @@ async def send_hourly_summary(
                 await send_telegram_photo(
                     image,
                     (
-                        f"🕐 <b>{coin} 1시간 트레이더 보드</b>\n"
+                        f"🗓 <b>{coin} 정기 트레이더 보드</b>\n"
                         f"{core}"
                     ),
-                    filename=f"{analysis.symbol.lower()}_hourly_board.png",
+                    filename=f"{analysis.symbol.lower()}_periodic_board.png",
                 )
             except Exception:
                 log.exception(
-                    "Hourly market image delivery failed: symbol=%s",
+                    "Periodic market image delivery failed: symbol=%s",
                     analysis.symbol,
                 )
         await send_telegram(build_hourly_summary_message(analyses, sentiment=sentiment))
@@ -270,11 +423,13 @@ async def send_hourly_summary(
         # Allow the next five-minute scan to retry this hour if Telegram was unavailable.
         store.release_signal(fingerprint_payload)
         raise
-    log.info("Hourly summary sent: symbols=%s", ",".join(item.symbol for item in analyses))
+    log.info("Periodic summary sent: symbols=%s", ",".join(item.symbol for item in analyses))
     return True
 
 
 async def scan_ema_and_notify(symbol: str, analysis: MarketAnalysis) -> int:
+    if not is_trade_symbol(symbol):
+        return 0
     enabled = os.getenv("EMA_SIGNAL_ALERTS_ENABLED", "true").strip().lower() in {
         "1", "true", "yes", "on"
     }
@@ -502,11 +657,24 @@ async def monitor_loop() -> None:
         "1", "true", "yes", "on"
     }
     await asyncio.sleep(10)
+    last_weekly_scan_hour: str | None = None
     while True:
         symbols = configured_symbols()
         analyses: list[MarketAnalysis] = []
         alerted_symbols: set[str] = set()
         dominance = None
+        weekly_scan_hour = datetime.now(UTC).strftime("%Y-%m-%dT%H")
+        if weekly_scan_hour != last_weekly_scan_hour:
+            for symbol in symbols:
+                if not is_trade_symbol(symbol):
+                    continue
+                try:
+                    await scan_weekly_cycle_and_notify(symbol)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Weekly cycle scan failed: symbol=%s", symbol)
+            last_weekly_scan_hour = weekly_scan_hour
         try:
             dominance = await get_usdt_dominance()
             await scan_dominance_and_notify(dominance)
@@ -524,6 +692,13 @@ async def monitor_loop() -> None:
             except Exception:
                 log.exception("Market monitor scan failed: symbol=%s", symbol)
                 continue
+            try:
+                if await scan_position_and_notify(symbol, analysis):
+                    alerted_symbols.add(symbol)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Position monitoring failed: symbol=%s", symbol)
             try:
                 if await scan_and_notify(symbol, analysis=analysis):
                     alerted_symbols.add(symbol)

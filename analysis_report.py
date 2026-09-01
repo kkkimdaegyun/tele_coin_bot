@@ -309,7 +309,7 @@ def build_hourly_summary_message(
 ) -> str:
     generated = datetime.now(UTC).astimezone(KST).strftime("%Y-%m-%d %H:%M")
     lines = [
-        "🕐 <b>1시간 정기 차트 브리핑</b>",
+        "🗓 <b>정기 사이클 차트 브리핑</b>",
         f"Binance 현물 시세 기준: {generated} KST",
     ]
     if sentiment is not None:
@@ -339,11 +339,16 @@ def build_hourly_summary_message(
             timeframe = analysis.timeframes.get(interval)
             if timeframe:
                 lines.append(escape(core_indicator_line(timeframe, TIMEFRAME_LABELS[interval])))
-        lines.append(
-            f"진입 판단: <b>{escape(entry.action_label)}</b> · "
-            f"조건 충족 {entry.score}/100(확률 아님) · "
-            f"{escape(entry.setup)}"
-        )
+        if entry.action == "market_context":
+            lines.append(
+                f"역할: <b>{escape(entry.action_label)}</b> · {escape(entry.setup)}"
+            )
+        else:
+            lines.append(
+                f"진입 판단: <b>{escape(entry.action_label)}</b> · "
+                f"조건 충족 {entry.score}/100(확률 아님) · "
+                f"{escape(entry.setup)}"
+            )
         lines.append(f"자금 판단: <b>{escape(capital_action_line(entry))}</b>")
         if capital_plan_line(entry):
             lines.append(f"분할 계획: {escape(capital_plan_line(entry))}")

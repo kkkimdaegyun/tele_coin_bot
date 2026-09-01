@@ -76,6 +76,31 @@ class ChartTeacherStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_dominance_observed_at
                     ON dominance_snapshots(observed_at DESC);
+
+                CREATE TABLE IF NOT EXISTS positions (
+                    symbol TEXT PRIMARY KEY,
+                    invested_krw INTEGER NOT NULL,
+                    average_entry_price REAL NOT NULL,
+                    stage INTEGER NOT NULL,
+                    invalidation_price REAL,
+                    status TEXT NOT NULL,
+                    opened_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS position_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    amount_krw INTEGER NOT NULL,
+                    price REAL NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_position_trades_symbol
+                    ON position_trades(symbol, created_at DESC);
+                CREATE TABLE IF NOT EXISTS bot_state (
+                    state_key TEXT PRIMARY KEY,
+                    state_value TEXT NOT NULL
+                );
                     """
                 )
                 columns = {
@@ -251,4 +276,203 @@ class ChartTeacherStore:
                 connection.execute(
                     "DELETE FROM sent_signals WHERE fingerprint=?",
                     (fingerprint,),
+                )
+
+    def record_buy(
+        self,
+        symbol: str,
+        *,
+        amount_krw: int,
+        price: float,
+        now_ms: int,
+        invalidation_price: float | None = None,
+    ) -> dict:
+        symbol = symbol.upper()
+        amount_krw = int(amount_krw)
+        price = float(price)
+        if amount_krw <= 0 or price <= 0:
+            raise ValueError("Buy amount and price must be positive")
+        with self._lock, closing(self._connect()) as connection:
+            with connection:
+                current = connection.execute(
+                    "SELECT * FROM positions WHERE symbol=? AND status='open'",
+                    (symbol,),
+                ).fetchone()
+                if current is None:
+                    invested = amount_krw
+                    average = price
+                    stage = 1
+                    opened_at = int(now_ms)
+                    invalidation = invalidation_price
+                else:
+                    previous_invested = int(current["invested_krw"])
+                    invested = previous_invested + amount_krw
+                    average = (
+                        float(current["average_entry_price"]) * previous_invested
+                        + price * amount_krw
+                    ) / invested
+                    stage = min(3, int(current["stage"]) + 1)
+                    opened_at = int(current["opened_at"])
+                    invalidation = (
+                        current["invalidation_price"]
+                        if current["invalidation_price"] is not None
+                        else invalidation_price
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO positions
+                        (symbol, invested_krw, average_entry_price, stage,
+                         invalidation_price, status, opened_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 'open', ?, ?)
+                    ON CONFLICT(symbol) DO UPDATE SET
+                        invested_krw=excluded.invested_krw,
+                        average_entry_price=excluded.average_entry_price,
+                        stage=excluded.stage,
+                        invalidation_price=excluded.invalidation_price,
+                        status='open',
+                        opened_at=excluded.opened_at,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        symbol,
+                        invested,
+                        average,
+                        stage,
+                        invalidation,
+                        opened_at,
+                        int(now_ms),
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO position_trades
+                        (symbol, side, amount_krw, price, created_at)
+                    VALUES (?, 'buy', ?, ?, ?)
+                    """,
+                    (symbol, amount_krw, price, int(now_ms)),
+                )
+                row = connection.execute(
+                    "SELECT * FROM positions WHERE symbol=?",
+                    (symbol,),
+                ).fetchone()
+        return dict(row)
+
+    def load_open_position(self, symbol: str) -> dict | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM positions WHERE symbol=? AND status='open'",
+                (symbol.upper(),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def load_open_positions(self) -> list[dict]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT * FROM positions WHERE status='open' ORDER BY symbol"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def close_position(self, symbol: str, *, price: float, now_ms: int) -> dict | None:
+        symbol = symbol.upper()
+        price = float(price)
+        if price <= 0:
+            raise ValueError("Close price must be positive")
+        with self._lock, closing(self._connect()) as connection:
+            with connection:
+                current = connection.execute(
+                    "SELECT * FROM positions WHERE symbol=? AND status='open'",
+                    (symbol,),
+                ).fetchone()
+                if current is None:
+                    return None
+                connection.execute(
+                    "UPDATE positions SET status='closed', updated_at=? WHERE symbol=?",
+                    (int(now_ms), symbol),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO position_trades
+                        (symbol, side, amount_krw, price, created_at)
+                    VALUES (?, 'close', ?, ?, ?)
+                    """,
+                    (symbol, int(current["invested_krw"]), price, int(now_ms)),
+                )
+        result = dict(current)
+        result["close_price"] = price
+        return result
+
+    def undo_last_buy(self, symbol: str, *, now_ms: int) -> dict | None:
+        symbol = symbol.upper()
+        with self._lock, closing(self._connect()) as connection:
+            with connection:
+                current = connection.execute(
+                    "SELECT * FROM positions WHERE symbol=? AND status='open'",
+                    (symbol,),
+                ).fetchone()
+                if current is None:
+                    return None
+                trade = connection.execute(
+                    """
+                    SELECT * FROM position_trades
+                    WHERE symbol=? AND side='buy' AND created_at>=?
+                    ORDER BY created_at DESC, id DESC LIMIT 1
+                    """,
+                    (symbol, int(current["opened_at"])),
+                ).fetchone()
+                if trade is None:
+                    return None
+                connection.execute("DELETE FROM position_trades WHERE id=?", (trade["id"],))
+                remaining = connection.execute(
+                    """
+                    SELECT amount_krw, price FROM position_trades
+                    WHERE symbol=? AND side='buy' AND created_at>=?
+                    ORDER BY created_at, id
+                    """,
+                    (symbol, int(current["opened_at"])),
+                ).fetchall()
+                if not remaining:
+                    connection.execute(
+                        "UPDATE positions SET status='closed', updated_at=? WHERE symbol=?",
+                        (int(now_ms), symbol),
+                    )
+                    position = None
+                else:
+                    invested = sum(int(row["amount_krw"]) for row in remaining)
+                    average = sum(
+                        int(row["amount_krw"]) * float(row["price"])
+                        for row in remaining
+                    ) / invested
+                    stage = min(3, len(remaining))
+                    connection.execute(
+                        """
+                        UPDATE positions
+                        SET invested_krw=?, average_entry_price=?, stage=?, updated_at=?
+                        WHERE symbol=?
+                        """,
+                        (invested, average, stage, int(now_ms), symbol),
+                    )
+                    row = connection.execute(
+                        "SELECT * FROM positions WHERE symbol=?",
+                        (symbol,),
+                    ).fetchone()
+                    position = dict(row)
+        return {"undone": dict(trade), "position": position}
+
+    def get_state(self, key: str) -> str | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT state_value FROM bot_state WHERE state_key=?",
+                (str(key),),
+            ).fetchone()
+        return str(row["state_value"]) if row is not None else None
+
+    def set_state(self, key: str, value: str) -> None:
+        with self._lock, closing(self._connect()) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO bot_state(state_key, state_value) VALUES (?, ?)
+                    ON CONFLICT(state_key) DO UPDATE SET state_value=excluded.state_value
+                    """,
+                    (str(key), str(value)),
                 )

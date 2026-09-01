@@ -1,0 +1,132 @@
+//@version=6
+indicator("Chart Teacher - BUY SELL v1", overlay=true, scale=scale.none, max_labels_count=200)
+
+// Chart Teacher의 역배열 반전 분할매수 규칙을 차트에 단순화해 표시합니다.
+// 모든 다중 시간대 값은 직전에 마감된 봉만 사용하여 리페인팅 위험을 줄입니다.
+
+showEma = input.bool(true, "현재 차트 EMA 20/50/200 표시")
+showBackground = input.bool(true, "BUY/SELL 배경 표시")
+showTable = input.bool(true, "상태표 표시")
+minimumVolume = input.float(1.2, "15m 최소 거래량 배수", minval=0.5, maxval=5.0, step=0.1)
+minimumRsi = input.float(35.0, "15m 최소 RSI", minval=10, maxval=70, step=1)
+maximumRsi = input.float(68.0, "15m 추격 차단 RSI", minval=50, maxval=90, step=1)
+maximumDayChange = input.float(8.0, "24시간 급등 차단 (%)", minval=1, maxval=30, step=0.5)
+
+alignment(float fast, float medium, float slow) =>
+    fast > medium and medium > slow ? 1 : fast < medium and medium < slow ? -1 : 0
+
+stateText(int state) =>
+    state == 1 ? "정배열" : state == -1 ? "역배열" : "혼조"
+
+stateColor(int state) =>
+    state == 1 ? color.rgb(0, 166, 81) : state == -1 ? color.rgb(220, 53, 69) : color.rgb(245, 166, 35)
+
+// 15분봉: 의미 있는 하락 뒤 양봉으로 직전 봉 고점을 회복했는지 확인합니다.
+[close15, ema20_15, ema50_15, ema200_15, rsi15, rsi15Prev, volumeRatio15, atrPercent15, declinePercent15, bullishReclaim15, change24h15] = request.security(
+    syminfo.tickerid,
+    "15",
+    [
+        close[1],
+        ta.ema(close, 20)[1],
+        ta.ema(close, 50)[1],
+        ta.ema(close, 200)[1],
+        ta.rsi(close, 14)[1],
+        ta.rsi(close, 14)[2],
+        volume[1] / ta.sma(volume, 20)[1],
+        ta.atr(14)[1] / close[1] * 100,
+        (ta.highest(high[6], 4) - ta.lowest(low[2], 4)) / ta.highest(high[6], 4) * 100,
+        close[1] > open[1] and close[1] > high[2],
+        (close[1] / close[97] - 1) * 100
+    ],
+    lookahead=barmerge.lookahead_on
+)
+
+// 1시간봉: 가격이 EMA20 위이고 최근 저점이 이전 저점보다 높아졌는지 확인합니다.
+[close1H, ema20_1H, ema50_1H, ema200_1H, rsi1H, recentLow1H, previousLow1H] = request.security(
+    syminfo.tickerid,
+    "60",
+    [
+        close[1],
+        ta.ema(close, 20)[1],
+        ta.ema(close, 50)[1],
+        ta.ema(close, 200)[1],
+        ta.rsi(close, 14)[1],
+        ta.lowest(low[1], 5),
+        ta.lowest(low[6], 5)
+    ],
+    lookahead=barmerge.lookahead_on
+)
+
+// 4시간봉: 중기 추세 회복과 이탈을 확인합니다.
+[close4H, close4HPrev, ema20_4H, ema20_4HPrev, ema50_4H, ema200_4H, rsi4H, volumeRatio4H] = request.security(
+    syminfo.tickerid,
+    "240",
+    [
+        close[1],
+        close[2],
+        ta.ema(close, 20)[1],
+        ta.ema(close, 20)[2],
+        ta.ema(close, 50)[1],
+        ta.ema(close, 200)[1],
+        ta.rsi(close, 14)[1],
+        volume[1] / ta.sma(volume, 20)[1]
+    ],
+    lookahead=barmerge.lookahead_on
+)
+
+[close1D, ema20_1D, ema50_1D, ema200_1D] = request.security(
+    syminfo.tickerid,
+    "D",
+    [close[1], ta.ema(close, 20)[1], ta.ema(close, 50)[1], ta.ema(close, 200)[1]],
+    lookahead=barmerge.lookahead_on
+)
+
+state15 = alignment(ema20_15, ema50_15, ema200_15)
+state1H = alignment(ema20_1H, ema50_1H, ema200_1H)
+state4H = alignment(ema20_4H, ema50_4H, ema200_4H)
+state1D = alignment(ema20_1D, ema50_1D, ema200_1D)
+
+meaningfulPullback = declinePercent15 >= math.max(0.35, atrPercent15 * 0.6)
+rsiTurningUp = rsi15 > rsi15Prev and rsi15 >= minimumRsi and rsi15 <= maximumRsi
+flowConfirmed = volumeRatio15 >= minimumVolume
+higherLow1H = recentLow1H > previousLow1H
+trendSupported = close1H >= ema20_1H and (close4H >= ema20_4H or rsi4H > 45)
+notChasing = change24h15 < maximumDayChange and rsi1H < 75
+
+rawBuy = meaningfulPullback and bullishReclaim15 and rsiTurningUp and flowConfirmed and higherLow1H and trendSupported and notChasing
+rawSell = close4H < ema20_4H and close4HPrev >= ema20_4HPrev and (rsi4H < 50 or volumeRatio4H >= 1.2)
+
+// 상위 시간봉 값이 여러 현재 차트 봉에 반복되므로 상태가 처음 바뀐 봉에만 라벨을 표시합니다.
+buySignal = barstate.isconfirmed and rawBuy and not rawBuy[1]
+sellSignal = barstate.isconfirmed and rawSell and not rawSell[1]
+
+ema20 = ta.ema(close, 20)
+ema50 = ta.ema(close, 50)
+ema200 = ta.ema(close, 200)
+plot(showEma ? ema20 : na, "EMA 20", color=color.rgb(255, 214, 10), linewidth=2)
+plot(showEma ? ema50 : na, "EMA 50", color=color.rgb(255, 128, 0), linewidth=2)
+plot(showEma ? ema200 : na, "EMA 200", color=color.rgb(60, 130, 246), linewidth=3)
+
+plotshape(buySignal, title="Chart Teacher BUY", style=shape.labelup, location=location.belowbar, color=color.rgb(42, 201, 91), textcolor=color.black, text="BUY\n1차 검토", size=size.normal)
+plotshape(sellSignal, title="Chart Teacher SELL", style=shape.labeldown, location=location.abovebar, color=color.rgb(244, 67, 54), textcolor=color.white, text="SELL\n축소 검토", size=size.normal)
+bgcolor(showBackground and buySignal ? color.new(color.green, 82) : showBackground and sellSignal ? color.new(color.red, 84) : na, title="Signal background")
+
+statusText = buySignal ? "BUY 1차 검토" : sellSignal ? "SELL 축소 검토" : notChasing ? "WAIT 조건 대기" : "추격 금지"
+statusColor = buySignal ? color.rgb(42, 201, 91) : sellSignal ? color.rgb(244, 67, 54) : notChasing ? color.rgb(245, 166, 35) : color.rgb(220, 53, 69)
+var table dashboard = table.new(position.top_right, 4, 3, frame_color=color.new(color.white, 55), frame_width=1, border_width=1)
+if barstate.islast and showTable
+    table.cell(dashboard, 0, 0, "1D", text_color=color.white, bgcolor=color.rgb(45, 45, 45))
+    table.cell(dashboard, 1, 0, "4H", text_color=color.white, bgcolor=color.rgb(45, 45, 45))
+    table.cell(dashboard, 2, 0, "1H", text_color=color.white, bgcolor=color.rgb(45, 45, 45))
+    table.cell(dashboard, 3, 0, "15m", text_color=color.white, bgcolor=color.rgb(45, 45, 45))
+    table.cell(dashboard, 0, 1, stateText(state1D), text_color=color.white, bgcolor=stateColor(state1D))
+    table.cell(dashboard, 1, 1, stateText(state4H), text_color=color.white, bgcolor=stateColor(state4H))
+    table.cell(dashboard, 2, 1, stateText(state1H), text_color=color.white, bgcolor=stateColor(state1H))
+    table.cell(dashboard, 3, 1, stateText(state15), text_color=color.white, bgcolor=stateColor(state15))
+    table.cell(dashboard, 0, 2, statusText, text_color=color.white, bgcolor=statusColor)
+    table.merge_cells(dashboard, 0, 2, 3, 2)
+if barstate.islast and not showTable
+    table.clear(dashboard, 0, 0, 3, 2)
+
+alertcondition(buySignal, "Chart Teacher BUY", "{{ticker}} 하락 후 반등 확인 · 1차 분할 진입 검토 · 종가 {{close}}")
+alertcondition(sellSignal, "Chart Teacher SELL", "{{ticker}} 4H EMA20 이탈과 추세 약화 · 축소/매도 검토 · 종가 {{close}}")

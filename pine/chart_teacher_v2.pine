@@ -7,7 +7,8 @@ indicator("Chart Teacher - Multi-Timeframe Trigger v2", overlay=true, max_lines_
 leftBars = input.int(5, "Pivot left bars", minval=2)
 rightBars = input.int(5, "Pivot right bars", minval=2)
 heartbeatEnabled = input.bool(true, "15분봉 마감마다 서버 종합 분석 요청")
-showLines = input.bool(true, "추세선 표시")
+showLines = input.bool(false, "추세선 표시 (기본 숨김)")
+showEma = input.bool(false, "EMA 20/50/200 표시 (기본 숨김)")
 
 ph = ta.pivothigh(high, leftBars, rightBars)
 pl = ta.pivotlow(low, leftBars, rightBars)
@@ -80,8 +81,8 @@ shouldAlert = barstate.isconfirmed and (downBreakout or upBreakdown or (heartbea
 if shouldAlert
     alert(makeJson(eventName), alert.freq_once_per_bar_close)
 
-plot(ema20, "EMA 20", color=color.yellow)
-plot(ema50, "EMA 50", color=color.orange)
-plot(ema200, "EMA 200", color=color.blue)
+plot(showEma ? ema20 : na, "EMA 20", color=color.yellow)
+plot(showEma ? ema50 : na, "EMA 50", color=color.orange)
+plot(showEma ? ema200 : na, "EMA 200", color=color.blue)
 plotshape(downBreakout, "하락 추세선 돌파", shape.labelup, location.belowbar, color=color.lime, text="TL 돌파")
 plotshape(upBreakdown, "상승 추세선 이탈", shape.labeldown, location.abovebar, color=color.red, text="TL 이탈")

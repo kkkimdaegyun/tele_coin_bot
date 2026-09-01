@@ -7,11 +7,11 @@ from telegram_client import send_telegram
 
 payload = {
     "event": "downtrend_breakout",
-    "symbol": "BTCUSDT",
+    "symbol": "ETHUSDT",
     "exchange": "BINANCE",
     "timeframe": "240",
-    "price": 123456.78,
-    "trendline_price": 122900.0,
+    "price": 3200.0,
+    "trendline_price": 3150.0,
 }
 
 async def main():

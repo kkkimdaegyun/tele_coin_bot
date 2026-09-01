@@ -1,3 +1,4 @@
+import asyncio
 import math
 import os
 import tempfile
@@ -32,11 +33,19 @@ from market_monitor import (
     _mark_recent_alert_image,
     _recent_alert_image_active,
     _significant_signal,
+    configured_symbols,
     quiet_hours_active,
+    scan_and_notify,
+    scan_ema_and_notify,
+    scan_position_and_notify,
+    scan_weekly_cycle_and_notify,
 )
+from position_manager import evaluate_position
+from telegram_commands import parse_telegram_command
 from pattern_education import pattern_one_line
 from storage import ChartTeacherStore
 from wave_context import wave_summary
+from weekly_strategy import evaluate_weekly_cycle
 
 
 def candles(count: int = 400, step: float = 0.5) -> list[Candle]:
@@ -97,7 +106,7 @@ class AnalysisEngineTests(unittest.TestCase):
             analysis,
             {"event": "pattern:쌍바닥", "timeframe": "1d", "description": "1d 쌍바닥 확인"},
         )
-        self.assertTrue(caption.startswith("<b>🔴 BTC · 지금 신규진입 0원 · 추격 금지</b>"))
+        self.assertTrue(caption.startswith("<b>🔵 BTC · 시장 관찰 전용 · 매수 대상 아님</b>"))
         self.assertIn("<b>감지 계기</b> · 1D 쌍바닥", caption)
         self.assertLessEqual(len(caption), 1024)
         self.assertIn("넥라인", pattern_one_line("쌍바닥", "confirmed"))
@@ -208,8 +217,8 @@ class AnalysisEngineTests(unittest.TestCase):
             guidance="공포 구간 · 단독 매수 신호 아님",
         )
         message = build_hourly_summary_message(analyses, sentiment=sentiment)
-        self.assertIn("1시간 정기 차트 브리핑", message)
-        self.assertIn("🔴 BTC · 지금 신규진입 0원 · 추격 금지", message)
+        self.assertIn("정기 사이클 차트 브리핑", message)
+        self.assertIn("🔵 BTC · 시장 관찰 전용 · 매수 대상 아님", message)
         self.assertIn("현재가: 64K", message)
         self.assertIn("현재가: 3.2K", message)
         self.assertIn("현재가: 150", message)
@@ -317,6 +326,22 @@ class AnalysisEngineTests(unittest.TestCase):
 
     def test_sol_is_enabled_by_default(self):
         self.assertEqual(DEFAULT_MONITOR_SYMBOLS, ("BTCUSDT", "ETHUSDT", "SOLUSDT"))
+        with patch.dict(os.environ, {"MONITOR_SYMBOLS": "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT"}):
+            self.assertEqual(configured_symbols(), ["BTCUSDT", "ETHUSDT", "SOLUSDT"])
+
+    def test_btc_is_context_only_and_has_no_proactive_coin_alerts(self):
+        dataset = candles()
+        analysis = analyze_market(
+            "BTCUSDT",
+            {key: dataset for key in ("1d", "4h", "1h", "15m")},
+        )
+        decision = evaluate_entry(analysis)
+        self.assertEqual(decision.action, "market_context")
+        self.assertEqual(decision.capital_plan.planned_krw, 0)
+        self.assertFalse(asyncio.run(scan_weekly_cycle_and_notify("BTCUSDT")))
+        self.assertFalse(asyncio.run(scan_and_notify("BTCUSDT", analysis)))
+        self.assertEqual(asyncio.run(scan_ema_and_notify("BTCUSDT", analysis)), 0)
+        self.assertFalse(asyncio.run(scan_position_and_notify("BTCUSDT", analysis)))
 
     def test_rsi_threshold_crossing_is_an_important_signal(self):
         dataset = candles()
@@ -336,6 +361,8 @@ class AnalysisEngineTests(unittest.TestCase):
             detail.ema20_distance_percent = 0
             detail.breakout_20 = False
             detail.ema20_touched = False
+            detail.pullback_reversal = False
+            detail.higher_low_confirmed = False
         analysis.timeframes["4h"].rsi_previous = 69.0
         analysis.timeframes["4h"].rsi = 71.0
         signal = _significant_signal(analysis)
@@ -353,7 +380,7 @@ class AnalysisEngineTests(unittest.TestCase):
     def test_entry_engine_allows_confirmed_breakout_but_blocks_fomo_chase(self):
         dataset = candles()
         analysis = analyze_market(
-            "BTCUSDT",
+            "ETHUSDT",
             {key: dataset for key in ("1d", "4h", "1h", "15m")},
         )
         for detail in analysis.timeframes.values():
@@ -380,7 +407,7 @@ class AnalysisEngineTests(unittest.TestCase):
         self.assertEqual(decision.action, "first_entry_review")
         self.assertGreaterEqual(decision.score, 65)
         self.assertIsNotNone(decision.invalidation)
-        self.assertIn("1차 분할 진입 검토", entry_headline("BTCUSDT", decision))
+        self.assertIn("BUY 후보", entry_headline("ETHUSDT", decision))
         analysis.important_patterns = [
             {
                 "name": "하락 추세선 돌파",
@@ -420,27 +447,168 @@ class AnalysisEngineTests(unittest.TestCase):
         self.assertEqual(risk_off.action, "wait_pullback")
         self.assertTrue(any("USDT.D" in item for item in risk_off.blockers))
 
-    def test_capital_plan_uses_seventy_million_and_first_ten_percent(self):
+    def test_entry_engine_confirms_pullback_then_reversal_before_review(self):
         dataset = candles()
         analysis = analyze_market(
-            "BTCUSDT",
+            "ETHUSDT",
+            {key: dataset for key in ("1d", "4h", "1h", "15m")},
+        )
+        for detail in analysis.timeframes.values():
+            detail.direction_score = 62
+            detail.close = 110
+            detail.ema20 = 105
+            detail.ema50 = 100
+            detail.ema200 = 95
+            detail.rsi = 56
+            detail.rsi_previous = 52
+            detail.change_24h = 1.5
+            detail.ema20_distance_percent = 0.5
+            detail.atr_percent = 0.8
+            detail.volume_ratio = 1.0
+            detail.taker_buy_ratio = 0.50
+            detail.breakout_20 = False
+            detail.ema20_touched = False
+            detail.pullback_reversal = False
+            detail.higher_low_confirmed = False
+
+        trigger = analysis.timeframes["15m"]
+        trigger.pullback_reversal = True
+        trigger.volume_ratio = 1.4
+        trigger.taker_buy_ratio = 0.57
+        analysis.timeframes["1h"].higher_low_confirmed = True
+
+        decision = evaluate_entry(analysis)
+        self.assertEqual(decision.action, "first_entry_review")
+        self.assertEqual(decision.setup, "15m 하락 후 반등 확인")
+        self.assertIn("15m 조정 뒤 직전 봉 고점 회복", decision.reasons)
+        self.assertIn("1H 저점 상승 확인", decision.reasons)
+
+    def test_capital_plan_uses_eth_cycle_budget_and_thirty_percent_tranches(self):
+        dataset = candles()
+        analysis = analyze_market(
+            "ETHUSDT",
             {key: dataset for key in ("1d", "4h", "1h", "15m")},
         )
         with patch.dict(
             os.environ,
             {
-                "PLANNED_CAPITAL_KRW_BTCUSDT": "70000000",
-                "ENTRY_FIRST_TRANCHE_PERCENT": "10",
-                "ENTRY_SECOND_TRANCHE_PERCENT": "15",
-                "ENTRY_THIRD_TRANCHE_PERCENT": "25",
+                "PLANNED_CAPITAL_KRW_ETHUSDT": "110000000",
+                "ENTRY_FIRST_TRANCHE_PERCENT": "30",
+                "ENTRY_SECOND_TRANCHE_PERCENT": "30",
+                "ENTRY_THIRD_TRANCHE_PERCENT": "40",
+                "CAPITAL_GUIDANCE_ENABLED": "true",
             },
         ):
             decision = evaluate_entry(analysis)
-        self.assertEqual(decision.capital_plan.planned_krw, 70_000_000)
-        self.assertEqual(decision.capital_plan.first_krw, 7_000_000)
-        self.assertEqual(decision.capital_plan.reserve_krw, 35_000_000)
-        self.assertIn("700만원", capital_action_line(decision))
-        self.assertIn("예비 3,500만원", capital_plan_line(decision))
+            action_line = capital_action_line(decision)
+            plan_line = capital_plan_line(decision)
+        self.assertEqual(decision.capital_plan.planned_krw, 110_000_000)
+        self.assertEqual(decision.capital_plan.first_krw, 33_000_000)
+        self.assertEqual(decision.capital_plan.second_krw, 33_000_000)
+        self.assertEqual(decision.capital_plan.third_krw, 44_000_000)
+        self.assertEqual(decision.capital_plan.reserve_krw, 0)
+        self.assertIn("3,300만원", action_line)
+        self.assertIn("3차 4,400만원", plan_line)
+
+    def test_telegram_buy_command_and_position_storage(self):
+        self.assertIsNone(parse_telegram_command("BTC 매수 700만원 69.5K"))
+        self.assertIsNone(parse_telegram_command("XRP 매수 700만원 1.2"))
+        command = parse_telegram_command("ETH 매수 3300만원 3.2K")
+        self.assertIsNotNone(command)
+        self.assertEqual(command.action, "buy")
+        self.assertEqual(command.symbol, "ETHUSDT")
+        self.assertEqual(command.amount_krw, 33_000_000)
+        self.assertEqual(command.price, 3_200)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ChartTeacherStore(Path(temporary) / "position.db")
+            first = store.record_buy(
+                "ETHUSDT",
+                amount_krw=33_000_000,
+                price=3_200,
+                now_ms=1_000,
+                invalidation_price=2_900,
+            )
+            second = store.record_buy(
+                "ETHUSDT",
+                amount_krw=33_000_000,
+                price=3_000,
+                now_ms=2_000,
+            )
+            self.assertEqual(first["stage"], 1)
+            self.assertEqual(second["stage"], 2)
+            self.assertEqual(second["invested_krw"], 66_000_000)
+            self.assertAlmostEqual(second["average_entry_price"], 3_100)
+            self.assertEqual(store.load_open_position("ETHUSDT")["stage"], 2)
+
+            undone = store.undo_last_buy("ETHUSDT", now_ms=2_500)
+            self.assertEqual(undone["undone"]["amount_krw"], 33_000_000)
+            self.assertEqual(undone["position"]["stage"], 1)
+            self.assertEqual(undone["position"]["average_entry_price"], 3_200)
+
+            closed = store.close_position("ETHUSDT", price=4_000, now_ms=3_000)
+            self.assertIsNotNone(closed)
+            self.assertIsNone(store.load_open_position("ETHUSDT"))
+
+    def test_open_position_switches_to_second_entry_review(self):
+        dataset = candles()
+        analysis = analyze_market(
+            "ETHUSDT",
+            {key: dataset for key in ("1d", "4h", "1h", "15m")},
+        )
+        analysis.current_price = 101
+        for detail in analysis.timeframes.values():
+            detail.direction_score = 62
+            detail.close = 101
+            detail.ema20 = 100
+            detail.ema50 = 98
+            detail.ema200 = 95
+            detail.rsi = 56
+            detail.rsi_previous = 52
+            detail.change_24h = 1
+            detail.ema20_distance_percent = 0.5
+            detail.atr_percent = 0.8
+            detail.breakout_20 = False
+            detail.ema20_touched = False
+            detail.pullback_reversal = False
+            detail.higher_low_confirmed = False
+            detail.volume_ratio = 1.0
+            detail.taker_buy_ratio = 0.50
+        analysis.timeframes["15m"].pullback_reversal = True
+        analysis.timeframes["15m"].volume_ratio = 1.4
+        analysis.timeframes["15m"].taker_buy_ratio = 0.57
+        analysis.timeframes["1h"].higher_low_confirmed = True
+
+        with patch.dict(os.environ, {"CAPITAL_GUIDANCE_ENABLED": "true"}):
+            decision = evaluate_position(
+                analysis,
+                {
+                "symbol": "ETHUSDT",
+                "invested_krw": 7_000_000,
+                "average_entry_price": 100,
+                "stage": 1,
+                "invalidation_price": 95,
+                },
+            )
+        self.assertEqual(decision.action, "second_entry_review")
+        self.assertEqual(decision.amount_krw, 33_000_000)
+
+    def test_weekly_cycle_requires_confirmed_reversal(self):
+        detail = analyze_timeframe("1w", candles())
+        detail.pullback_reversal = True
+        detail.higher_low_confirmed = True
+        detail.rsi_previous = 38
+        detail.rsi = 44
+        detail.volume_ratio = 1.1
+        detail.ema50 = detail.close * 1.02
+        detail.bottom_score = 55
+        decision = evaluate_weekly_cycle(detail)
+        self.assertEqual(decision.action, "buy_candidate")
+        self.assertGreaterEqual(decision.score, 65)
+
+        detail.pullback_reversal = False
+        decision = evaluate_weekly_cycle(detail)
+        self.assertEqual(decision.action, "wait")
 
     def test_wave_summary_labels_structure_score_as_not_probability(self):
         summary = wave_summary(

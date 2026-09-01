@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from analysis_engine import MarketAnalysis, TimeframeAnalysis
 from indicator_summary import ema_alignment_label
+from strategy_universe import is_market_context_symbol, is_trade_symbol
 
 
 @dataclass(frozen=True)
@@ -43,7 +44,21 @@ class EntryDecision:
 
 
 def evaluate_entry(analysis: MarketAnalysis) -> EntryDecision:
-    capital_plan = _capital_plan(analysis.symbol)
+    capital_plan = capital_plan_for_symbol(analysis.symbol)
+    if not is_trade_symbol(analysis.symbol):
+        role = "BTC 시장 상태 관찰" if is_market_context_symbol(analysis.symbol) else "운용 대상 제외"
+        return EntryDecision(
+            score=0,
+            action="market_context",
+            action_label="시장 관찰 · 매수 대상 아님",
+            setup=role,
+            reasons=("ETH·SOL 진입 판단을 위한 참고 자료입니다.",),
+            blockers=("이 종목에는 신규 매수 예산을 배정하지 않았습니다.",),
+            entry_low=None,
+            entry_high=None,
+            invalidation=None,
+            capital_plan=capital_plan,
+        )
     one_day = analysis.timeframes.get("1d")
     four_hour = analysis.timeframes.get("4h")
     one_hour = analysis.timeframes.get("1h")
@@ -96,6 +111,7 @@ def evaluate_entry(analysis: MarketAnalysis) -> EntryDecision:
         and one_hour.close >= one_hour.ema20
         and flow_confirmed
     )
+    reversal = bool(fifteen.pullback_reversal and flow_confirmed)
     oversold_recovery = bool(
         one_hour.rsi is not None
         and one_hour.rsi_previous is not None
@@ -105,6 +121,10 @@ def evaluate_entry(analysis: MarketAnalysis) -> EntryDecision:
         setup = "15m 돌파 확인"
         score += 20
         reasons.append("15m 20봉 고점 돌파")
+    elif reversal:
+        setup = "15m 하락 후 반등 확인"
+        score += 18
+        reasons.append("15m 조정 뒤 직전 봉 고점 회복")
     elif pullback:
         setup = "EMA20 눌림 지지"
         score += 16
@@ -115,6 +135,10 @@ def evaluate_entry(analysis: MarketAnalysis) -> EntryDecision:
         reasons.append("1H RSI 30 회복")
     else:
         setup = "진입 조건 미완성"
+
+    if one_hour.higher_low_confirmed:
+        score += 6
+        reasons.append("1H 저점 상승 확인")
 
     if fifteen.volume_ratio is not None:
         if fifteen.volume_ratio >= 1.5:
@@ -187,7 +211,7 @@ def evaluate_entry(analysis: MarketAnalysis) -> EntryDecision:
         )
 
     score = max(0, min(round(score), 100))
-    has_trigger = breakout or pullback or oversold_recovery
+    has_trigger = breakout or reversal or pullback or oversold_recovery
     if blockers:
         action = "wait_pullback"
         action_label = "추격 금지 · 눌림 대기"
@@ -226,8 +250,12 @@ def format_krw(amount: int) -> str:
 
 def capital_action_line(decision: EntryDecision) -> str:
     plan = decision.capital_plan
+    if decision.action == "market_context":
+        return "신규매수 대상 아님 · 시장 판단에만 사용"
     if plan.planned_krw <= 0:
         return "계획금액 미설정 · 자동 주문 없음"
+    if not capital_guidance_enabled():
+        return "실행 금액 안내 잠금 · 사이클 조건과 손실 한도 검증 전"
     first = f"1차 {format_krw(plan.first_krw)}({plan.first_percent:g}%)"
     if decision.action == "first_entry_review":
         return f"{first} 분할 진입 검토 · 자동 주문 없음"
@@ -249,27 +277,29 @@ def capital_plan_line(decision: EntryDecision) -> str:
 
 def entry_headline(symbol: str, decision: EntryDecision) -> str:
     coin = symbol.upper().removesuffix("USDT")
+    if decision.action == "market_context":
+        return f"🔵 {coin} · 시장 관찰 전용 · 매수 대상 아님"
     first_amount = (
         format_krw(decision.capital_plan.first_krw)
-        if decision.capital_plan.planned_krw > 0
-        else "금액 미설정"
+        if decision.capital_plan.planned_krw > 0 and capital_guidance_enabled()
+        else "금액 잠금"
     )
     if decision.action == "first_entry_review":
-        return f"🟢 {coin} · 1차 분할 진입 검토 · {first_amount}"
+        return f"🟢 {coin} · BUY 후보 · 1차 {first_amount} 검토"
     if decision.action == "wait_pullback":
-        return f"🔴 {coin} · 지금 신규진입 0원 · 추격 금지"
+        return f"🔴 {coin} · BUY 금지 · 지금 신규진입 0원"
     if decision.action == "watch":
         return f"🟡 {coin} · 진입 준비 · 1차 {first_amount} 대기"
     return f"⚪ {coin} · 관망 · 지금 신규진입 0원"
 
 
-def _capital_plan(symbol: str) -> CapitalPlan:
+def capital_plan_for_symbol(symbol: str) -> CapitalPlan:
     raw = os.getenv(
         f"PLANNED_CAPITAL_KRW_{symbol.upper()}",
         os.getenv("PLANNED_CAPITAL_KRW_PER_SYMBOL", "0"),
     )
     try:
-        planned = max(0, int(float(raw)))
+        planned = max(0, int(float(raw))) if is_trade_symbol(symbol) else 0
     except (TypeError, ValueError):
         planned = 0
 
@@ -292,6 +322,12 @@ def _capital_plan(symbol: str) -> CapitalPlan:
         reserve_percent=reserve,
         reserve_krw=_rounded_amount(planned, reserve),
     )
+
+
+def capital_guidance_enabled() -> bool:
+    return os.getenv("CAPITAL_GUIDANCE_ENABLED", "false").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
 
 
 def _percentage(name: str, default: float) -> float:

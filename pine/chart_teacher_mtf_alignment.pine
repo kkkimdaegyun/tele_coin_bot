@@ -2,11 +2,11 @@
 indicator("Chart Teacher - MTF EMA Alignment", overlay=true, max_labels_count=100)
 
 // Confirmed bars reduce intrabar state changes and repainting.
-showEma = input.bool(true, "Show chart EMAs")
-showRibbon = input.bool(true, "Show EMA 20/50 ribbon")
-showConsensusBackground = input.bool(true, "Tint background when 3+ timeframes agree")
+showEma = input.bool(false, "Show chart EMAs")
+showRibbon = input.bool(false, "Show EMA 20/50 ribbon")
+showConsensusBackground = input.bool(false, "Tint background when 3+ timeframes agree")
 showHeatmap = input.bool(true, "Show timeframe heatmap")
-showTouches = input.bool(true, "Show EMA touch dots")
+showTouches = input.bool(false, "Show EMA touch dots")
 touchTolerancePercent = input.float(0.05, "EMA touch tolerance (%)", minval=0.0, maxval=1.0, step=0.01)
 
 alignment(float fast, float medium, float slow) =>

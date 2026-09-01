@@ -1,0 +1,68 @@
+//@version=6
+indicator("Chart Teacher - Weekly BUY SELL v1", overlay=true, scale=scale.none, max_labels_count=100)
+
+// 주봉으로 큰 매집·축소 구간을 찾는 장기 사이클 지표입니다.
+// 직전에 마감된 주봉만 사용하므로 진행 중인 주봉에서는 신호가 확정되지 않습니다.
+
+showEma20 = input.bool(true, "주봉 EMA20 표시")
+showEma50 = input.bool(true, "주봉 EMA50 표시")
+showEma200 = input.bool(false, "주봉 EMA200 표시 (기본 숨김)")
+showBackground = input.bool(false, "신호 배경 표시 (기본 숨김)")
+showTable = input.bool(false, "상태표 표시 (기본 숨김)")
+minimumVolume = input.float(0.9, "BUY 최소 주봉 거래량 배수", minval=0.3, maxval=3.0, step=0.1)
+maximumBuyRsi = input.float(58.0, "BUY 최대 RSI", minval=40, maxval=70, step=1)
+
+[openW, highW, lowW, closeW, closeWPrev, ema20W, ema20WPrev, ema50W, ema200W, rsiW, rsiWPrev, volumeRatioW, atrPercentW, declinePercentW, bullishReclaimW, higherLowW, directionWeakW] = request.security(
+    syminfo.tickerid,
+    "W",
+    [
+        open[1],
+        high[1],
+        low[1],
+        close[1],
+        close[2],
+        ta.ema(close, 20)[1],
+        ta.ema(close, 20)[2],
+        ta.ema(close, 50)[1],
+        ta.ema(close, 200)[1],
+        ta.rsi(close, 14)[1],
+        ta.rsi(close, 14)[2],
+        volume[1] / ta.sma(volume, 20)[1],
+        ta.atr(14)[1] / close[1] * 100,
+        (ta.highest(high[6], 4) - ta.lowest(low[2], 4)) / ta.highest(high[6], 4) * 100,
+        close[1] > open[1] and close[1] > high[2],
+        ta.lowest(low[1], 5) > ta.lowest(low[6], 5),
+        close[1] < ta.ema(close, 20)[1] and ta.rsi(close, 14)[1] < 50
+    ],
+    lookahead=barmerge.lookahead_on
+)
+
+meaningfulCorrection = declinePercentW >= math.max(4.0, atrPercentW * 0.6)
+rsiRecovery = rsiW > rsiWPrev and rsiW >= 30 and rsiW <= maximumBuyRsi
+volumeConfirmed = volumeRatioW >= minimumVolume
+notExtended = closeW <= ema50W * 1.05
+
+rawBuy = meaningfulCorrection and bullishReclaimW and rsiRecovery and volumeConfirmed and (higherLowW or closeW > ema20W) and notExtended
+rawSell = closeW < ema20W and closeWPrev >= ema20WPrev and rsiW < rsiWPrev and (directionWeakW or volumeRatioW >= 1.0)
+buySignal = barstate.isconfirmed and rawBuy and not rawBuy[1]
+sellSignal = barstate.isconfirmed and rawSell and not rawSell[1]
+
+// [1]로 확정된 주봉 값만 가져오므로 이 선들은 진행 중인 주에는 움직이지 않습니다.
+plot(showEma20 ? ema20W : na, "Weekly EMA 20", color=color.rgb(255, 214, 10), linewidth=2, style=plot.style_stepline)
+plot(showEma50 ? ema50W : na, "Weekly EMA 50", color=color.rgb(255, 128, 0), linewidth=3, style=plot.style_stepline)
+plot(showEma200 ? ema200W : na, "Weekly EMA 200", color=color.rgb(60, 130, 246), linewidth=3, style=plot.style_stepline)
+plotshape(buySignal, "Weekly BUY", shape.labelup, location.belowbar, color=color.rgb(64, 230, 104), textcolor=color.black, text="W BUY\n매집 후보", size=size.normal)
+plotshape(sellSignal, "Weekly SELL", shape.labeldown, location.abovebar, color=color.rgb(244, 67, 54), textcolor=color.white, text="W SELL\n축소 검토", size=size.normal)
+bgcolor(showBackground and buySignal ? color.new(color.green, 80) : showBackground and sellSignal ? color.new(color.red, 82) : na)
+
+var table status = table.new(position.top_right, 1, 4, frame_color=color.new(color.white, 55), frame_width=1)
+if barstate.islast and showTable
+    table.cell(status, 0, 0, "Chart Teacher 주봉", text_color=color.white, bgcolor=color.rgb(45, 45, 45))
+    table.cell(status, 0, 1, "RSI " + str.tostring(rsiW, "#.0") + " · 거래량 " + str.tostring(volumeRatioW, "#.0") + "x", text_color=color.white, bgcolor=color.rgb(55, 65, 81))
+    table.cell(status, 0, 2, higherLowW ? "저점 상승" : "저점 확인 중", text_color=color.white, bgcolor=higherLowW ? color.rgb(0, 166, 81) : color.rgb(245, 166, 35))
+    table.cell(status, 0, 3, rawBuy ? "BUY 매집 후보" : rawSell ? "SELL 축소 검토" : "WAIT", text_color=color.white, bgcolor=rawBuy ? color.rgb(0, 166, 81) : rawSell ? color.rgb(220, 53, 69) : color.rgb(90, 90, 90))
+if barstate.islast and not showTable
+    table.clear(status, 0, 0, 0, 3)
+
+alertcondition(buySignal, "Chart Teacher Weekly BUY", "{{ticker}} 주봉 반전 확인 · 장기 매집 후보 · 종가 {{close}}")
+alertcondition(sellSignal, "Chart Teacher Weekly SELL", "{{ticker}} 주봉 EMA20 이탈·모멘텀 약화 · 축소 검토 · 종가 {{close}}")

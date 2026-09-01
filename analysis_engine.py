@@ -38,6 +38,8 @@ class TimeframeAnalysis:
     ema20_distance_percent: float | None
     breakout_20: bool
     ema20_touched: bool
+    pullback_reversal: bool
+    higher_low_confirmed: bool
     support: float | None
     resistance: float | None
     direction_score: int
@@ -205,6 +207,8 @@ def analyze_timeframe(interval: str, candles: list[Candle]) -> TimeframeAnalysis
         and current.low <= current_ema20 * 1.001
         and current.high >= current_ema20 * 0.999
     )
+    pullback_reversal = _pullback_reversal(candles, atr_value, rsi_series)
+    higher_low_confirmed = bool(len(lows) >= 2 and lows[-1][1] > lows[-2][1])
     return TimeframeAnalysis(
         interval=interval,
         structure=structure,
@@ -227,6 +231,8 @@ def analyze_timeframe(interval: str, candles: list[Candle]) -> TimeframeAnalysis
         ),
         breakout_20=breakout_20,
         ema20_touched=ema20_touched,
+        pullback_reversal=pullback_reversal,
+        higher_low_confirmed=higher_low_confirmed,
         support=_rounded(support),
         resistance=_rounded(resistance),
         direction_score=score,
@@ -235,6 +241,40 @@ def analyze_timeframe(interval: str, candles: list[Candle]) -> TimeframeAnalysis
         reasons=reasons[:5],
         invalidation=invalidation,
     )
+
+
+def _pullback_reversal(
+    candles: list[Candle],
+    atr_value: float | None,
+    rsi_series: list[float | None],
+) -> bool:
+    """Confirm that a real pullback has started reversing on a closed candle."""
+    if len(candles) < 9:
+        return False
+
+    current = candles[-1]
+    previous = candles[-2]
+    earlier = candles[-9:-5]
+    later = candles[-5:-1]
+    prior_peak = max(candle.high for candle in earlier)
+    pullback_low = min(candle.low for candle in later)
+    decline_percent = (
+        (prior_peak - pullback_low) / prior_peak * 100 if prior_peak > 0 else 0.0
+    )
+    atr_percent = (
+        atr_value / current.close * 100
+        if atr_value is not None and current.close > 0
+        else 0.0
+    )
+    meaningful_pullback = decline_percent >= max(0.35, atr_percent * 0.6)
+    bullish_reclaim = current.close > current.open and current.close > previous.high
+    rsi_turning_up = bool(
+        len(rsi_series) >= 2
+        and rsi_series[-1] is not None
+        and rsi_series[-2] is not None
+        and rsi_series[-1] > rsi_series[-2]
+    )
+    return meaningful_pullback and bullish_reclaim and rsi_turning_up
 
 
 def _taker_buy_ratio(candles: list[Candle]) -> float | None:

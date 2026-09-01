@@ -12,9 +12,10 @@ load_dotenv(Path(__file__).with_name(".env"))
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from analysis_service import build_live_report
-from formatter import build_message
 from market_monitor import monitor_loop
 from telegram_client import send_telegram
+from telegram_commands import telegram_command_loop
+from strategy_universe import TRADE_SYMBOLS
 
 log = logging.getLogger("chart-teacher-bot")
 
@@ -24,17 +25,22 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     monitor_enabled = os.getenv("AUTO_MONITOR_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    commands_enabled = os.getenv("TELEGRAM_COMMANDS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
     monitor_task = asyncio.create_task(monitor_loop()) if monitor_enabled else None
+    command_task = asyncio.create_task(telegram_command_loop()) if commands_enabled else None
     try:
         yield
     finally:
-        if monitor_task:
-            monitor_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await monitor_task
+        for task in (monitor_task, command_task):
+            if task:
+                task.cancel()
+        for task in (monitor_task, command_task):
+            if task:
+                with suppress(asyncio.CancelledError):
+                    await task
 
 
-app = FastAPI(title="Chart Teacher Bot", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Chart Teacher Bot", version="0.3.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -68,10 +74,10 @@ async def _deliver(payload: dict):
     try:
         symbol = str(payload.get("symbol", "")).upper().replace("BINANCE:", "")
         event = str(payload.get("event", "TradingView Webhook"))
-        if symbol in {"BTCUSDT", "ETHUSDT", "SOLUSDT"}:
-            _, message = await build_live_report(symbol, trigger=event)
-        else:
-            message = build_message(payload)
+        if symbol not in TRADE_SYMBOLS:
+            log.info("Webhook ignored for non-trading symbol: symbol=%s", symbol)
+            return
+        _, message = await build_live_report(symbol, trigger=event)
         await send_telegram(message)
         log.info("Telegram sent: event=%s symbol=%s tf=%s",
                  payload.get("event"), payload.get("symbol"), payload.get("timeframe"))
